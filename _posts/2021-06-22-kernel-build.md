@@ -51,7 +51,8 @@ $ sudo make install
 // 빌드된 커널 설치
 $ shutdown -r now
 ```
-6. .vimrc 설정
+6. vim 설정 (.vimrc 파일)
+
 ```bash
 set hlsearch
 set nu
