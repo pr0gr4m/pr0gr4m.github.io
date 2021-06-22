@@ -52,7 +52,6 @@ $ sudo make install
 $ shutdown -r now
 ```
 6. vim 설정 (.vimrc 파일)
-
 ```bash
 set hlsearch
 set nu
