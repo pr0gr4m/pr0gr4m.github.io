@@ -52,7 +52,7 @@ $ sudo make install
 $ shutdown -r now
 ```
 6. .vimrc 설정
-```vimrc
+```bash
 set hlsearch
 set nu
 set autoindent
