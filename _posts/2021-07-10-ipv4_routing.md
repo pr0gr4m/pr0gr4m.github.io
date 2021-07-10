@@ -167,3 +167,148 @@ struct rtable {
 
 ## FIB Table
 
+라우팅 테이블은 fib_table 구조체로 표현된다. 해당 구조체의 정의는 다음과 같다.  
+```c
+struct fib_table {
+	struct hlist_node	tb_hlist;
+	u32			tb_id;
+	int			tb_num_default;
+	struct rcu_head		rcu;
+	unsigned long 		*tb_data;
+	unsigned long		__data[];
+};
+```
+* tb_id : 테이블 식별자. Policy Routing을 사용하지 않으면 [rt_class_t](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/rtnetlink.h#L338)에 정의되어 있는 테이블만 생성 및 식별된다.
+* tb_num_default : 테이블 기본 경로 개수. 테이블을 생성하는 fib_trie_table() 함수에서 0으로 초기화된다. 기본 경로가 추가되면 fib_table_insert() 함수를 통해 1 증가하고, 기본 경로가 삭제되면 fib_table_delete() 함수를 통해 1 감소한다.
+
+### fib_info
+
+각 라우팅 항목들은 fib_info 구조체로 표현된다. fib_info 객체는 [fib_create_info()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L1347) 함수로 생성되며, [fib_info_hash](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L51)라고 하는 해시 테이블에 저장된다.  
+[fib_info_cnt](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L54)라고 하는 fib_info 객체의 전역 카운터가 있는데, 해당 카운터는 fib_create_info() 함수에서 fib_info 객체를 생성하면 증가하고, [free_fib_info()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L248) 함수에서 fib_info 객체가 해제되면 감소한다.  
+fib_info_hash 해시 테이블은 해당 카운터에 따라 크기가 동적으로 조정된다. 또한, 테이블의 탐색은 [fib_find_info()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L399) 함수에 의해 이뤄진다.  
+fib_info 구조체의 정의는 다음과 같다.  
+```c
+struct fib_info {
+	struct hlist_node	fib_hash;
+	struct hlist_node	fib_lhash;
+	struct list_head	nh_list;
+	struct net		*fib_net;
+	int			fib_treeref;
+	refcount_t		fib_clntref;
+	unsigned int		fib_flags;
+	unsigned char		fib_dead;
+	unsigned char		fib_protocol;
+	unsigned char		fib_scope;
+	unsigned char		fib_type;
+	__be32			fib_prefsrc;
+	u32			fib_tb_id;
+	u32			fib_priority;
+	struct dst_metrics	*fib_metrics;
+#define fib_mtu fib_metrics->metrics[RTAX_MTU-1]
+#define fib_window fib_metrics->metrics[RTAX_WINDOW-1]
+#define fib_rtt fib_metrics->metrics[RTAX_RTT-1]
+#define fib_advmss fib_metrics->metrics[RTAX_ADVMSS-1]
+	int			fib_nhs;
+	bool			fib_nh_is_v6;
+	bool			nh_updated;
+	struct nexthop		*nh;
+	struct rcu_head		rcu;
+	struct fib_nh		fib_nh[];
+};
+```
+주요 필드를 설명하면 다음과 같다.
+* fib_treeref : fib_alias 객체의 수를 나타내는 카운터이다. fib_alias 객체는 fib_info 객체에 대한 참조를 가지고 있다.
+* fib_clntref : fib_info 객체에 대한 참조 카운터이다. 해당 필드가 0이 되면 fib_info 객체가 할당 해제된다.
+* fib_dead : fib_info 객체의 해제가 허용됐는지를 가리키는 플래그.
+* fib_protocol : 해당 경로의 라우팅 프로토콜 식별자이다. 예를 들어 ```ip route add proto static 192.168.5.3 via 192.168.2.1```와 같이 추가할 수 있다. 다음과 같은 값을 가질 수 있다.
+    * RTPROT_UNSPEC : 오류 값
+    * RTPROT_REDIRECT : 해당 라우터 항목이 수신 ICMP 재지정 메시지의 결과로 생성된 것이다.
+    * RTPROT_KERNEL : 라우팅 항목이 커널에서 생성된 것이다.
+    * RTPROT_BOOT : 해당 플래그가 설정되면 관리자가 proto static 한정자를 지정하지 않고 경로를 추가한 것이다.
+    * RTPROT_STATIC : 시스템 관리자가 설치한 경로이다.
+    * 그 외에도 사용자 라우팅 데몬에 의해 항목이 추가되면 다양한 값이 설정될 수 있다.
+* fib_scope : 목적지 주소의 범위이다. 범위는 다른 노드에서 호스트까지의 거리를 가리킨다. 다음 중 하나가 될 수 있다.
+    * RT_SCOPE_HOST : 노드는 다른 네트워크 노드와 통신할 수 없다. 루프백 주소의 범위이다.
+        * 로컬 경로인 경우 해당 값이 할당된다.
+    * RT_SCOPE_UNIVERSE : 어디서든 사용될 수 있는 주소의 범위이다.
+        * 모든 게이트웨이 유니캐스트 경로에는 해당 값이 할당된다.
+    * RT_SCOPE_LINK : 해당 주소는 직접 연결된 호스트에서만 접근할 수 있다.
+        * 직접 유니캐스트와 브로드캐스트 경로인 경우 해당 값이 할당된다.
+    * RT_SCOPE_SITE : IPv6에서 사용되는 범위
+    * RT_SCOPE_NOWHERE : 존재하지 않는 목적지 범위
+* fib_type : 경로의 형식이다. 예를 들어 ```ip route add prohibit 192.168.1.17 from 192.168.2.103``` 같이 추가하면 RTN_PROHIBIT으로 설정된다.
+* fib_priority : 경로의 우선순위이다. 기본 값이 0이며, 값이 낮을수록 우선순위가 높아진다.
+* fib_nhs : 다음 홉의 개수이다. 다중경로 라우팅이 설정돼 있지 않으면 이 값은 1보다 클 수 없다.
+* fib_dev : 다음 홉으로 패킷을 전송할 네트워크 장치
+* fib_nh : 다음 홉을 나타내며, 단일경로 라우팅에서는 fib_nh[0]만 사용된다.
+
+모든 경로 타입에 따른 error와 scope가 fib_props라는 전역 변수에 저장되어 있다. 해당 배열은 다음과 같다.
+```c
+const struct fib_prop fib_props[RTN_MAX + 1] = {
+	[RTN_UNSPEC] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_NOWHERE,
+	},
+	[RTN_UNICAST] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_LOCAL] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_HOST,
+	},
+	[RTN_BROADCAST] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_LINK,
+	},
+	[RTN_ANYCAST] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_LINK,
+	},
+	[RTN_MULTICAST] = {
+		.error	= 0,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_BLACKHOLE] = {
+		.error	= -EINVAL,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_UNREACHABLE] = {
+		.error	= -EHOSTUNREACH,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_PROHIBIT] = {
+		.error	= -EACCES,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_THROW] = {
+		.error	= -EAGAIN,
+		.scope	= RT_SCOPE_UNIVERSE,
+	},
+	[RTN_NAT] = {
+		.error	= -EINVAL,
+		.scope	= RT_SCOPE_NOWHERE,
+	},
+	[RTN_XRESOLVE] = {
+		.error	= -EINVAL,
+		.scope	= RT_SCOPE_NOWHERE,
+	},
+};
+```
+
+예를 들어 RTN_UNICAST 경로 type이면, 오류는 없고 경로 범위가 RT_SCOPE_UNIVERSE이다. RTN_PROHIBIT이면 오류 값은 -EACESS이고, 범위는 RT_SCOPE_UNIVERSE이다.  
+위에서 언급한 fib_table_lookup() 함수에서 경로를 찾은 후, 경로의 type에 따라 error를 식별하여 다음과 같이 탐색을 중단할 수 있다.  
+```c
+		err = fib_props[fa->fa_type].error;
+		if (unlikely(err < 0)) {
+out_reject:
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			this_cpu_inc(stats->semantic_match_passed);
+#endif
+			trace_fib_table_lookup(tb->tb_id, flp, NULL, err);
+			return err;
+		}
+```
+위 경우 fib_lookup() 함수는 오류를 반환하고 오류 값에 따라 특정 동작이 일어난다.  
+예를 들어, -EACCESS의 경우 ICMP_PKT_FILTERED 코드가 설정된 ICMPv4 메시지가 회신되고 패킷이 drop된다.  
+
