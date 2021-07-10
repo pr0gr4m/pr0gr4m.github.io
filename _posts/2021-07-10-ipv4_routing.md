@@ -312,3 +312,101 @@ out_reject:
 위 경우 fib_lookup() 함수는 오류를 반환하고 오류 값에 따라 특정 동작이 일어난다.  
 예를 들어, -EACCESS의 경우 ICMP_PKT_FILTERED 코드가 설정된 ICMPv4 메시지가 회신되고 패킷이 drop된다.  
 
+### Next Hop
+
+다음 홉을 나타내는 fib_nh 구조체의 정의는 다음과 같다.  
+```c
+struct fib_nh_common {
+	struct net_device	*nhc_dev;
+	int			nhc_oif;
+	unsigned char		nhc_scope;
+	u8			nhc_family;
+	u8			nhc_gw_family;
+	unsigned char		nhc_flags;
+	struct lwtunnel_state	*nhc_lwtstate;
+
+	union {
+		__be32          ipv4;
+		struct in6_addr ipv6;
+	} nhc_gw;
+
+	int			nhc_weight;
+	atomic_t		nhc_upper_bound;
+
+	/* v4 specific, but allows fib6_nh with v4 routes */
+	struct rtable __rcu * __percpu *nhc_pcpu_rth_output;
+	struct rtable __rcu     *nhc_rth_input;
+	struct fnhe_hash_bucket	__rcu *nhc_exceptions;
+};
+
+struct fib_nh {
+	struct fib_nh_common	nh_common;
+	struct hlist_node	nh_hash;
+	struct fib_info		*nh_parent;
+#ifdef CONFIG_IP_ROUTE_CLASSID
+	__u32			nh_tclassid;
+#endif
+	__be32			nh_saddr;
+	int			nh_saddr_genid;
+#define fib_nh_family		nh_common.nhc_family
+#define fib_nh_dev		nh_common.nhc_dev
+#define fib_nh_oif		nh_common.nhc_oif
+#define fib_nh_flags		nh_common.nhc_flags
+#define fib_nh_lws		nh_common.nhc_lwtstate
+#define fib_nh_scope		nh_common.nhc_scope
+#define fib_nh_gw_family	nh_common.nhc_gw_family
+#define fib_nh_gw4		nh_common.nhc_gw.ipv4
+#define fib_nh_gw6		nh_common.nhc_gw.ipv6
+#define fib_nh_weight		nh_common.nhc_weight
+#define fib_nh_upper_bound	nh_common.nhc_upper_bound
+};
+```
+IPv6를 위한 fib6_nh 구조체가 생기면서 주요한 공동 부분은 fib_nh_common 구조체에 위치하게 되었다.  
+주요 멤버는 다음과 같다.  
+* nh_dev : 송신할 다음 홉 네트워크 장치이다.
+* nh_oif : 송신할 다음 홉 인터페이스 index이다.
+* nh_scope : 송신할 다음 홉 scope이다.
+* nh_rth_input : Rx 경로의 fib_result 객체 캐시를 위한 필드이다.
+* nh_pcpu_rth_output : Tx 경로의 fib_result 객체 캐시를 위한 필드이다.
+
+nh_dev에 설정되어 있는 네트워크 장치가 비활성화되면 NETDEV_DOWN 알림이 전송된다.  
+이 이벤트를 처리하는 함수는 [fib_netdev_event()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L1443)이다.  
+해당 콜백은 [ip_fib_init()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L1618)함수에서 [fib_netdev_notifier](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L1506) 객체를 통해 등록한다.  
+fib_netdev_event() 함수는 NETDEV_DOWN 이벤트를 수신하면 [fib_disable_ip()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L1402) 함수를 호출한다. 해당 함수의 정의는 다음과 같다.  
+```c
+static void fib_disable_ip(struct net_device *dev, unsigned long event,
+			   bool force)
+{
+	if (fib_sync_down_dev(dev, event, force))	// fib_flags나 fib_nh_flags에 RTNH_F_DEAD 플래그를 설정한다.
+		fib_flush(dev_net(dev));		// 경로가 비워진다.
+	else
+		rt_cache_flush(dev_net(dev));
+	arp_ifdown(dev);
+}
+```
+
+#### Next Hop Exception
+
+라우팅 항목이 사용자(관리자)의 명령이 아닌 ICMPv4 재지정 메시지의 결과 등으로 변경되는 경우를 처리하기 위하여 다음 홉 예외를 사용한다.  
+다음 홉 예외 처리를 위한 구조체 fib_nh_exception의 정의는 다음과 같다.  
+```c
+struct fib_nh_exception {
+	struct fib_nh_exception __rcu	*fnhe_next;
+	int				fnhe_genid;
+	__be32				fnhe_daddr;
+	u32				fnhe_pmtu;
+	bool				fnhe_mtu_locked;
+	__be32				fnhe_gw;
+	unsigned long			fnhe_expires;
+	struct rtable __rcu		*fnhe_rth_input;
+	struct rtable __rcu		*fnhe_rth_output;
+	unsigned long			fnhe_stamp;
+	struct rcu_head			rcu;
+};
+```
+다음 홉 예외는 [update_or_create_fnhe()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L627)함수로 생성되는데, 해당 함수는 다음과 같은 상황에서 사용된다.
+* [__ip_do_redirect()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L777) 함수에서 ICMPv4 Redirect 메시지를 수신한 경우
+* [__ip_rt_update_pmtu()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L1029) 함수에서 PMTU(경로의 최소 MTU)가 변경된 경우
+
+### Policy Routing
+
