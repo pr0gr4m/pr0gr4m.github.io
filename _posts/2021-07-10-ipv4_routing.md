@@ -645,3 +645,257 @@ reject_redirect:
 
 ## FIB TRIE
 
+포스트 초기에 fib_lookup() 함수에서 실제 테이블 탐색을 [fib_table_lookup()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_trie.c#L1432) 함수로 수행한다고 했다.  
+fib_table_lookup() 함수는 라우팅 항목을 TRIE 구조로 관리한다. 해당 함수의 정의는 다음과 같다.  
+```c
+/* should be called with rcu_read_lock */
+int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
+		     struct fib_result *res, int fib_flags)
+{
+	struct trie *t = (struct trie *) tb->tb_data;
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+	struct trie_use_stats __percpu *stats = t->stats;
+#endif
+	const t_key key = ntohl(flp->daddr);
+	struct key_vector *n, *pn;
+	struct fib_alias *fa;
+	unsigned long index;
+	t_key cindex;
+
+	pn = t->kv;
+	cindex = 0;
+
+	n = get_child_rcu(pn, cindex);
+	if (!n) {
+		trace_fib_table_lookup(tb->tb_id, flp, NULL, -EAGAIN);
+		return -EAGAIN;
+	}
+
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+	this_cpu_inc(stats->gets);
+#endif
+
+	/* Step 1: Travel to the longest prefix match in the trie */
+	for (;;) {
+		index = get_cindex(key, n);
+
+		/* This bit of code is a bit tricky but it combines multiple
+		 * checks into a single check.  The prefix consists of the
+		 * prefix plus zeros for the "bits" in the prefix. The index
+		 * is the difference between the key and this value.  From
+		 * this we can actually derive several pieces of data.
+		 *   if (index >= (1ul << bits))
+		 *     we have a mismatch in skip bits and failed
+		 *   else
+		 *     we know the value is cindex
+		 *
+		 * This check is safe even if bits == KEYLENGTH due to the
+		 * fact that we can only allocate a node with 32 bits if a
+		 * long is greater than 32 bits.
+		 */
+		if (index >= (1ul << n->bits))
+			break;
+
+		/* we have found a leaf. Prefixes have already been compared */
+		if (IS_LEAF(n))
+			goto found;
+
+		/* only record pn and cindex if we are going to be chopping
+		 * bits later.  Otherwise we are just wasting cycles.
+		 */
+		if (n->slen > n->pos) {
+			pn = n;
+			cindex = index;
+		}
+
+		n = get_child_rcu(n, index);
+		if (unlikely(!n))
+			goto backtrace;
+	}
+
+	/* Step 2: Sort out leaves and begin backtracing for longest prefix */
+	for (;;) {
+		/* record the pointer where our next node pointer is stored */
+		struct key_vector __rcu **cptr = n->tnode;
+
+		/* This test verifies that none of the bits that differ
+		 * between the key and the prefix exist in the region of
+		 * the lsb and higher in the prefix.
+		 */
+		if (unlikely(prefix_mismatch(key, n)) || (n->slen == n->pos))
+			goto backtrace;
+
+		/* exit out and process leaf */
+		if (unlikely(IS_LEAF(n)))
+			break;
+
+		/* Don't bother recording parent info.  Since we are in
+		 * prefix match mode we will have to come back to wherever
+		 * we started this traversal anyway
+		 */
+
+		while ((n = rcu_dereference(*cptr)) == NULL) {
+backtrace:
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			if (!n)
+				this_cpu_inc(stats->null_node_hit);
+#endif
+			/* If we are at cindex 0 there are no more bits for
+			 * us to strip at this level so we must ascend back
+			 * up one level to see if there are any more bits to
+			 * be stripped there.
+			 */
+			while (!cindex) {
+				t_key pkey = pn->key;
+
+				/* If we don't have a parent then there is
+				 * nothing for us to do as we do not have any
+				 * further nodes to parse.
+				 */
+				if (IS_TRIE(pn)) {
+					trace_fib_table_lookup(tb->tb_id, flp,
+							       NULL, -EAGAIN);
+					return -EAGAIN;
+				}
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+				this_cpu_inc(stats->backtrack);
+#endif
+				/* Get Child's index */
+				pn = node_parent_rcu(pn);
+				cindex = get_index(pkey, pn);
+			}
+
+			/* strip the least significant bit from the cindex */
+			cindex &= cindex - 1;
+
+			/* grab pointer for next child node */
+			cptr = &pn->tnode[cindex];
+		}
+	}
+
+found:
+	/* this line carries forward the xor from earlier in the function */
+	index = key ^ n->key;
+
+	/* Step 3: Process the leaf, if that fails fall back to backtracing */
+	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
+		struct fib_info *fi = fa->fa_info;
+		struct fib_nh_common *nhc;
+		int nhsel, err;
+
+		if ((BITS_PER_LONG > KEYLENGTH) || (fa->fa_slen < KEYLENGTH)) {
+			if (index >= (1ul << fa->fa_slen))
+				continue;
+		}
+		if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
+			continue;
+		if (fi->fib_dead)
+			continue;
+		if (fa->fa_info->fib_scope < flp->flowi4_scope)
+			continue;
+		fib_alias_accessed(fa);
+		err = fib_props[fa->fa_type].error;
+		if (unlikely(err < 0)) {
+out_reject:
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			this_cpu_inc(stats->semantic_match_passed);
+#endif
+			trace_fib_table_lookup(tb->tb_id, flp, NULL, err);
+			return err;
+		}
+		if (fi->fib_flags & RTNH_F_DEAD)
+			continue;
+
+		if (unlikely(fi->nh)) {
+			if (nexthop_is_blackhole(fi->nh)) {
+				err = fib_props[RTN_BLACKHOLE].error;
+				goto out_reject;
+			}
+
+			nhc = nexthop_get_nhc_lookup(fi->nh, fib_flags, flp,
+						     &nhsel);
+			if (nhc)
+				goto set_result;
+			goto miss;
+		}
+
+		for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++) {
+			nhc = fib_info_nhc(fi, nhsel);
+
+			if (!fib_lookup_good_nhc(nhc, fib_flags, flp))
+				continue;
+set_result:
+			if (!(fib_flags & FIB_LOOKUP_NOREF))
+				refcount_inc(&fi->fib_clntref);
+
+			res->prefix = htonl(n->key);
+			res->prefixlen = KEYLENGTH - fa->fa_slen;
+			res->nh_sel = nhsel;
+			res->nhc = nhc;
+			res->type = fa->fa_type;
+			res->scope = fi->fib_scope;
+			res->fi = fi;
+			res->table = tb;
+			res->fa_head = &n->leaf;
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			this_cpu_inc(stats->semantic_match_passed);
+#endif
+			trace_fib_table_lookup(tb->tb_id, flp, nhc, err);
+
+			return err;
+		}
+	}
+miss:
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+	this_cpu_inc(stats->semantic_match_miss);
+#endif
+	goto backtrace;
+}
+```
+
+```found:``` 레이블 이 전 까지는 TRIE node를 탐색하는 과정이다.  
+TRIE Leef node를 찾으면, 그에 맞는 fib_alias 리스트를 순회하며 fib_info 객체를 구한다.  
+```c
+	hlist_for_each_entry_rcu(fa, &n->leaf, fa_list) {
+		struct fib_info *fi = fa->fa_info;
+```
+경로의 tos나 scope 등을 검사한 후, error 코드가 설정되어 있다면 fib_info 파트에서 설명한 바와 같이 error를 처리한다.
+```c
+		if (unlikely(err < 0)) {
+out_reject:
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			this_cpu_inc(stats->semantic_match_passed);
+#endif
+			trace_fib_table_lookup(tb->tb_id, flp, NULL, err);
+			return err;
+		}
+```
+적절한 경로를 찾았다면 fib_result에 경로 정보를 저장한다.
+```c
+		for (nhsel = 0; nhsel < fib_info_num_path(fi); nhsel++) {
+			nhc = fib_info_nhc(fi, nhsel);
+
+			if (!fib_lookup_good_nhc(nhc, fib_flags, flp))
+				continue;
+set_result:
+			if (!(fib_flags & FIB_LOOKUP_NOREF))
+				refcount_inc(&fi->fib_clntref);
+
+			res->prefix = htonl(n->key);
+			res->prefixlen = KEYLENGTH - fa->fa_slen;
+			res->nh_sel = nhsel;
+			res->nhc = nhc;
+			res->type = fa->fa_type;
+			res->scope = fi->fib_scope;
+			res->fi = fi;
+			res->table = tb;
+			res->fa_head = &n->leaf;
+#ifdef CONFIG_IP_FIB_TRIE_STATS
+			this_cpu_inc(stats->semantic_match_passed);
+#endif
+			trace_fib_table_lookup(tb->tb_id, flp, nhc, err);
+
+			return err;
+		}
+	}
+```
