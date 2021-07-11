@@ -470,5 +470,178 @@ TOS가 0x02인 fib_info가 생성된 상태에서 TOS가 0x04인 라우팅 항�
 7. 아니라면 ```new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);``` 라인으로 새로운 fib_alias 할당
 8. ```new_fa->fa_info = fi;``` 라인으로 fib_alias가 기존의 fib_info를 가리키도록 지정
 
-## ICMP Redirect 메시지
+## ICMPv4 Redirect 메시지
+
+라우팅 항목의 입력 장치와 출력 장치가 같으면 항목이 suboptimal이 될 수 있다.  
+이러한 경우 ICMPv4 Redirect 메시지가 전송된다. ICMPv4 Redirect 메시지의 코드는 다음과 같다.  
+* ICMP_REDIR_NET : 네트워크 재지정
+* ICMP_REDIR_HOST : 호스트 재지정
+* ICMP_REDIR_NETTOS	: TOS에 대한 네트워크 재지정
+* ICMP_REDIR_HOSTTOS : TOS에 대한 호스트 재지정
+
+다음 그림은 suboptimal route의 예시를 보여준다.  
+![host_redirect](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/host_redirect.png?raw=true)
+
+위 구성에서 세 대의 장비 모두 같은 서브넷(192.168.2.0/24)에 있고 모두 게이트웨이(192.168.2.1)를 통해 연결되어 있다.  
+AMD 서버에서는 ```ip route add 192.168.2.7 via 192.168.2.10``` 명령으로 윈도우 서버를 노트북에 접근하는 게이트웨이로 추가했다.  
+AMD 서버에서 노트북에 트래픽을 전송하면 default gateway가 192.168.2.10 이므로 윈도우 서버에 전송된다.  
+하지만 구성 상 AMD 서버는 노트북에 직접 트래픽을 전송하는 것이 가능하며, 이 편이 더욱 효율적이다.  
+따라서 윈도우 서버에서는 AMD 서버에서 자신에게 전송한 경로가 suboptimal인 것을 감지하고, AMD 서버에 ICMP_REDIR_HOST 코드가 설정된 ICMPv4 Redirect 메시지를 회신한다.  
+
+### ICMPv4 Redirect 메시지 생성
+
+ICMPv4 Redirect 메시지는 suboptimal 경로가 있으면 전송된다. Redirect 메시지의 생성은 두 단계로 수행된다.  
+* [__mkroute_input()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L1778) 함수 : RTCF_DOREDIRECT 플래그가 설정된다.
+* [ip_forward()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/ip_forward.c#L152) 함수 : [ip_rt_send_redirect()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L856) 함수를 호출해 실제로 ICMPv4 Redirect 메시지가 전송된다.
+
+__mkroute_input() 함수에서 RTCF_DOREDIRECT 플래그가 설정되려면 다음 조건이 모두 충족돼야 한다.
+* 입력 장치와 출력 장치가 같다.
+* /proc/sys/net/ipv4/conf/<device name>/sned_redirects 가 설정돼 있다.
+* 발신 장치가 shared media이거나 출발지 주소와 다음 홉 게이트웨이 주소가 같은 서브넷에 있다.
+```c
+	if (out_dev == in_dev && err && IN_DEV_TX_REDIRECTS(out_dev) &&
+	    skb->protocol == htons(ETH_P_IP)) {
+		__be32 gw;
+
+		gw = nhc->nhc_gw_family == AF_INET ? nhc->nhc_gw.ipv4 : 0;
+		if (IN_DEV_SHARED_MEDIA(out_dev) ||
+		    inet_addr_onlink(out_dev, saddr, gw))
+			IPCB(skb)->flags |= IPSKB_DOREDIRECT;
+	}
+
+	rth->dst.input = ip_forward;	
+```
+
+ip_forward() 함수에서 ICMPv4 Redirect 메시지 송신하는 코드는 다음과 같다.
+```c
+	/*
+	 *	We now generate an ICMP HOST REDIRECT giving the route
+	 *	we calculated.
+	 */
+	if (IPCB(skb)->flags & IPSKB_DOREDIRECT && !opt->srr &&
+	    !skb_sec_path(skb))
+		ip_rt_send_redirect(skb);
+```
+
+ip_rt_send_redirect() 함수에서는 icmp_send() 함수로 실제 ICMPv4 메시지를 송신한다.
+```c
+	if (!peer) {
+		icmp_send(skb, ICMP_REDIRECT, ICMP_REDIR_HOST,
+			  rt_nexthop(rt, ip_hdr(skb)->daddr));
+		return;
+	}
+```
+
+네 번째 매개변수인 rt_nexthop()의 결과는 advised gateway 주소이며, 이 전 그림 예시의 경우 192.168.2.7(노트북의 주소)이 될 것이다.
+
+### ICMPv4 Redirect 메시지 수신
+
+ICMPv4 Redirect 메시지 핸들러는 다음과 같이 icmp_redirect() 함수이다.  
+```c
+	[ICMP_REDIRECT] = {
+		.handler = icmp_redirect,
+		.error = 1,
+	},
+```
+
+처리 과정은 다음과 같다.
+1. [icmp_redirect()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/icmp.c#L964) 함수에서 icmp_socket_deliver() 함수를 호출한다.
+2. [icmp_socket_deliver()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/icmp.c#L815) 함수에서 ICMPv4 프로토콜의 error handler를 호출한다.
+3. icmp_protocol 변수에 등록된 err_handler 함수 icmp_err()가 호출된다.
+4. [icmp_err()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/icmp.c#L1320) 함수에서 ICMP_REDIRECT 메시지를 ipv4_redirect() 함수로 처리한다.
+5. [ipv4_redirect()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L1141) 함수에서 [__ip_do_redirect()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L720) 함수를 호출하여 처리한다.
+
+__ip_do_redirect() 함수의 정의는 다음과 같다.
+```c
+static void __ip_do_redirect(struct rtable *rt, struct sk_buff *skb, struct flowi4 *fl4,
+			     bool kill_route)
+{
+	__be32 new_gw = icmp_hdr(skb)->un.gateway;
+	__be32 old_gw = ip_hdr(skb)->saddr;
+	struct net_device *dev = skb->dev;
+	struct in_device *in_dev;
+	struct fib_result res;
+	struct neighbour *n;
+	struct net *net;
+
+	switch (icmp_hdr(skb)->code & 7) {
+	case ICMP_REDIR_NET:
+	case ICMP_REDIR_NETTOS:
+	case ICMP_REDIR_HOST:
+	case ICMP_REDIR_HOSTTOS:
+		break;
+
+	default:
+		return;
+	}
+
+	if (rt->rt_gw_family != AF_INET || rt->rt_gw4 != old_gw)
+		return;
+
+	in_dev = __in_dev_get_rcu(dev);
+	if (!in_dev)
+		return;
+
+	net = dev_net(dev);
+	if (new_gw == old_gw || !IN_DEV_RX_REDIRECTS(in_dev) ||
+	    ipv4_is_multicast(new_gw) || ipv4_is_lbcast(new_gw) ||
+	    ipv4_is_zeronet(new_gw))
+		goto reject_redirect;
+
+	if (!IN_DEV_SHARED_MEDIA(in_dev)) {
+		if (!inet_addr_onlink(in_dev, new_gw, old_gw))
+			goto reject_redirect;
+		if (IN_DEV_SEC_REDIRECTS(in_dev) && ip_fib_check_default(new_gw, dev))
+			goto reject_redirect;
+	} else {
+		if (inet_addr_type(net, new_gw) != RTN_UNICAST)
+			goto reject_redirect;
+	}
+
+	n = __ipv4_neigh_lookup(rt->dst.dev, new_gw);
+	if (!n)
+		n = neigh_create(&arp_tbl, &new_gw, rt->dst.dev);
+	if (!IS_ERR(n)) {
+		if (!(n->nud_state & NUD_VALID)) {
+			neigh_event_send(n, NULL);
+		} else {
+			if (fib_lookup(net, fl4, &res, 0) == 0) {
+				struct fib_nh_common *nhc;
+
+				fib_select_path(net, &res, fl4, skb);
+				nhc = FIB_RES_NHC(res);
+				update_or_create_fnhe(nhc, fl4->daddr, new_gw,
+						0, false,
+						jiffies + ip_rt_gc_timeout);
+			}
+			if (kill_route)
+				rt->dst.obsolete = DST_OBSOLETE_KILL;
+			call_netevent_notifiers(NETEVENT_NEIGH_UPDATE, n);
+		}
+		neigh_release(n);
+	}
+	return;
+
+reject_redirect:
+#ifdef CONFIG_IP_ROUTE_VERBOSE
+	if (IN_DEV_LOG_MARTIANS(in_dev)) {
+		const struct iphdr *iph = (const struct iphdr *) skb->data;
+		__be32 daddr = iph->daddr;
+		__be32 saddr = iph->saddr;
+
+		net_info_ratelimited("Redirect from %pI4 on %s about %pI4 ignored\n"
+				     "  Advised path = %pI4 -> %pI4\n",
+				     &old_gw, dev->name, &new_gw,
+				     &saddr, &daddr);
+	}
+#endif
+	;
+}
+```
+
+다양한 검사를 수행한 후, ```n = __ipv4_neigh_lookup(rt->dst.dev, new_gw);``` 라인으로 이웃 서브시스템에서 탐색을 수행한다.  
+탐색 키는 ICMPv4 메시지에서 추출한 advised gateway인 new_gw의 주소이다.  
+```update_or_create_fnhe(nhc, fl4->daddr, new_gw, 0, false, jiffies + ip_rt_gc_timeout);``` 라인으로 new_gw의 IP 주소를 지정해 fib_nh_exception를 업데이트/생성한다.  
+
+## FIB TRIE
 
