@@ -124,7 +124,7 @@ struct fib_result {
 * table : 탐색이 수행되는 FIB 테이블을 가리키는 포인터이다.
 * fa_head : fib_alias 리스를 가리키는 포인터이다. fib_alias 객체를 사용할 경우 각 라우팅 항목마다 별도의 fib_info 객체가 생성되는 것을 방지함으로써 라우팅 항목의 최적화가 이뤄진다. fib_alias 구조체는 추후에 설명한다.
 
-fib_lookup() 함수는 fib_get_table() 함수로 Main FIB 테이블을 가져와 fib_table_lookup() 함수로 탐색을 수행한다.  
+fib_lookup() 함수는 fib_get_table() 함수로 Main 혹은 Local FIB 테이블을 가져와 fib_table_lookup() 함수로 탐색을 수행한다.  
 탐색이 성공적으로 수행되고 나면 [dst 객체](https://elixir.bootlin.com/linux/latest/source/include/net/dst.h#L25)가 생성되며, 주요 필드는 이 전 IPv4 포스트에서 언급했듯이 input과 output 콜백이다. 해당 콜백은 라우팅 탐색 결과에 따라 적절한 핸들러가 할당된다.  
 dst 객체는 rtable 구조체에 포함되며, rtable 객체는 SKB와 연관된 라우팅 항목을 나타낸다. rtable 구조체의 정의는 다음과 같다.  
 ```c
@@ -178,7 +178,7 @@ struct fib_table {
 	unsigned long		__data[];
 };
 ```
-* tb_id : 테이블 식별자. Policy Routing을 사용하지 않으면 [rt_class_t](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/rtnetlink.h#L338)에 정의되어 있는 테이블만 생성 및 식별된다.
+* tb_id : 테이블 식별자. Policy Routing을 사용하지 않으면 [rt_class_t](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/rtnetlink.h#L338)에 정의되어 있는 기본 테이블만 생성 및 식별된다. (RT_TABLE_MAIN, RT_TABLE_LOCAL)
 * tb_num_default : 테이블 기본 경로 개수. 테이블을 생성하는 fib_trie_table() 함수에서 0으로 초기화된다. 기본 경로가 추가되면 fib_table_insert() 함수를 통해 1 증가하고, 기본 경로가 삭제되면 fib_table_delete() 함수를 통해 1 감소한다.
 
 ### fib_info
@@ -409,4 +409,66 @@ struct fib_nh_exception {
 * [__ip_rt_update_pmtu()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/route.c#L1029) 함수에서 PMTU(경로의 최소 MTU)가 변경된 경우
 
 ### Policy Routing
+
+Routing Lookup에서 보았던 CONFIG_IP_MULTIPLE_TABLES 옵션이 설정되면 정책 라우팅을 사용한다.  
+
+정책 라우팅을 사용하지 않으면 [fib4_rules_init()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L51) 함수에 의해 로컬 테이블과 메인 테이블만 생성된다.  
+로컬 테이블은 로컬 주소의 라우팅 항목을 포함하며, 라우팅 항목은 커널에 의해 로컬 테이블에만 추가될 수 있다.  
+메인 테이블은 시스템 관리자에 의해 ```ip route add``` 등의 명령으로 항목이 추가된다.  
+
+정책 라우팅을 사용하면 다른 [fib4_rules_init()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_rules.c#L408) 함수에 의해 rule이 초기화된다.  
+이 경우 초기 테이블로 Local, Main, Default 테이블이 생성되고, 255개의 라우팅 테이블이 만들어질 수 있다.  
+
+메인 테이블에는 시스템 관리자 명령인 ip 또는 route를 통해 다음과 같이 접근할 수 있다.  
+* ```ip route add``` : 경로 추가 시 사용자 공간에서 RTM_NEWROUTE 메시지를 전송하여 [inet_rtm_newroute()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L866) 함수에서 처리
+* ```ip route del``` : 경로 삭제 시 사용자 공간에서 RTM_DELROUTE 메시지를 전송하여 [inet_rtm_delroute()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L836) 함수에서 처리
+* ```ip route show``` : 메인 테이블 덤프 시 사용자 공간에서 RTM_GETROUTE 메시지를 전송하여 [inet_dump_finb()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_frontend.c#L965) 함수에서 처리
+* ```route show table local``` : 로컬 테이블 덤프 명령어
+* ```route add/del``` : IOCTL 메시지를 ip_rt_ioctl() 함수에서 처리
+
+### FIB Alias
+
+다음과 같이 목적지 주소나 서브넷이 같고 TOS만 다른 라우팅 항목이 여러 개 생성될 수 있다.
+```bash
+$ ip route add 192.168.1.10 via 192.168.2.1 tos 0x2
+$ ip route add 192.168.1.10 via 192.168.2.1 tos 0x4
+$ ip route add 192.168.1.10 via 192.168.2.1 tos 0x6
+```
+
+이러한 경우 각 경로마다 fib_info가 생성되는 대신 fib_alias 객체가 생성된다. fib_alias 구조체의 정의는 다음과 같다.  
+```c
+struct fib_alias {
+	struct hlist_node	fa_list;
+	struct fib_info		*fa_info;
+	u8			fa_tos;
+	u8			fa_type;
+	u8			fa_state;
+	u8			fa_slen;
+	u32			tb_id;
+	s16			fa_default;
+	u8			offload:1,
+				trap:1,
+				offload_failed:1,
+				unused:5;
+	struct rcu_head		rcu;
+};
+```
+
+fib_alias 객체는 서브넷은 같지만 매개변수가 다른 경로를 저장한다. 여러 개의 fib_alias 객체에서 하나의 fib_info 객체를 공유할 수 있다.  
+이 경우 fib_alias 객체의 fa_info 멤버가 같은 fib_info 객체를 가리킬 것이다.  
+다음 그림은 예시 명령어의 결과로 fa_tos만 다른 세 개의 fib_alias 객체가 하나의 fib_info를 공유하는 모습이다.
+![fib_alias](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/fib_alias.png?raw=true)
+
+fib_alias 생성은 [fib_table_insert()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_trie.c#L1203) 함수에서 일어난다.  
+TOS가 0x02인 fib_info가 생성된 상태에서 TOS가 0x04인 라우팅 항목을 생성한다고 가정하면 다음과 같다.  
+1. ```fi = fib_create_info(cfg, extack);``` 라인에서 fib_info 객체 생성
+2. [fib_create_info()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/fib_semantics.c#L1347) 함수에서 ```fi = kzalloc(struct_size(fi, fib_nh, nhs), GFP_KERNEL);``` 라인으로 fib_info 객체 생성
+3. fib_create_info() 함수에서 ```ofi = fib_find_info(fi);``` 라인으로 비슷한 fib_info 객체 탐색
+4. 비슷한 객체가 만들어지면 새로 만들어진 fib_info 객체는 free_fib_info() 함수로 해제하고 기존의 fib_info 객체의 fib_treeref 카운터를 1 증가시켜서 반환
+5. fib_create_info() 함수에서 ```fa = l ? fib_find_alias(&l->leaf, slen, tos, fi->fib_priority, tb->tb_id, false) : NULL;``` 라인으로 기존에 만들어진 fib_alias가 있는지 탐색
+6. 기존에 tos와 priority가 같은 fib_alias가 존재한다면 대체하거나 무시한다. (현재 TOS가 0x04인 fib_alias는 없을 테니 해당 루틴은 실행되지 않음)
+7. 아니라면 ```new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);``` 라인으로 새로운 fib_alias 할당
+8. ```new_fa->fa_info = fi;``` 라인으로 fib_alias가 기존의 fib_info를 가리키도록 지정
+
+## ICMP Redirect 메시지
 
