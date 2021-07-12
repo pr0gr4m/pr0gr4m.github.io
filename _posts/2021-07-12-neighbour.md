@@ -267,3 +267,107 @@ static struct packet_type arp_packet_type __read_mostly = {
 };
 ```
 
+### 이웃 생성과 해제
+
+이웃 객체는 ___neigh_create() 함수로 생성된다. 과거에 사용되던 [__neigh_create()](https://elixir.bootlin.com/linux/latest/source/net/core/neighbour.c#L674) 함수는 해당 함수의 래퍼이다.  
+```c
+static struct neighbour *___neigh_create(struct neigh_table *tbl,
+					 const void *pkey,
+					 struct net_device *dev,
+					 bool exempt_from_gc, bool want_ref)
+{
+	struct neighbour *n1, *rc, *n = neigh_alloc(tbl, dev, exempt_from_gc);
+	u32 hash_val;
+	unsigned int key_len = tbl->key_len;
+	int error;
+	struct neigh_hash_table *nht;
+	...
+	/* Protocol specific setup. */
+	if (tbl->constructor &&	(error = tbl->constructor(n)) < 0) {
+		rc = ERR_PTR(error);
+		goto out_neigh_release;
+	}
+	...
+	n->confirmed = jiffies - (NEIGH_VAR(n->parms, BASE_REACHABLE_TIME) << 1);
+	...
+	if (atomic_read(&tbl->entries) > (1 << nht->hash_shift))
+		nht = neigh_hash_grow(tbl, nht->hash_shift + 1);
+	...
+}
+
+static struct neighbour *neigh_alloc(struct neigh_table *tbl,
+				     struct net_device *dev,
+				     bool exempt_from_gc)
+{
+	struct neighbour *n = NULL;
+	unsigned long now = jiffies;
+	int entries;
+
+	if (exempt_from_gc)
+		goto do_alloc;
+
+	entries = atomic_inc_return(&tbl->gc_entries) - 1;
+	if (entries >= tbl->gc_thresh3 ||
+	    (entries >= tbl->gc_thresh2 &&
+	     time_after(now, tbl->last_flush + 5 * HZ))) {
+		if (!neigh_forced_gc(tbl) &&
+		    entries >= tbl->gc_thresh3) {
+			net_info_ratelimited("%s: neighbor table overflow!\n",
+					     tbl->id);
+			NEIGH_CACHE_STAT_INC(tbl, table_fulls);
+			goto out_entries;
+		}
+	}
+
+do_alloc:
+	n = kzalloc(tbl->entry_size + dev->neigh_priv_len, GFP_ATOMIC);
+	if (!n)
+		goto out_entries;
+
+	__skb_queue_head_init(&n->arp_queue);
+	rwlock_init(&n->lock);
+	seqlock_init(&n->ha_lock);
+	n->updated	  = n->used = now;
+	n->nud_state	  = NUD_NONE;
+	n->output	  = neigh_blackhole;
+	seqlock_init(&n->hh.hh_lock);
+	n->parms	  = neigh_parms_clone(&tbl->parms);
+	timer_setup(&n->timer, neigh_timer_handler, 0);
+
+	NEIGH_CACHE_STAT_INC(tbl, allocs);
+	n->tbl		  = tbl;
+	refcount_set(&n->refcnt, 1);
+	n->dead		  = 1;
+	INIT_LIST_HEAD(&n->gc_list);
+
+	atomic_inc(&tbl->entries);
+out:
+	return n;
+
+out_entries:
+	if (!exempt_from_gc)
+		atomic_dec(&tbl->gc_entries);
+	goto out;
+}
+```
+
+우선 neigh_alloc() 함수를 호출하여 이웃 객체를 할당한다.  
+neigh_alloc() 함수에서는 테이블 항목의 수가 gc_thresh3 보다 크거나 테이블 항목의 수가 gc_thresh2 보다 크고, 마지막으로 테이블을 비운 후 지나간 시간이 5Hz 보다 크면 동기화 가비지 컬렉터 함수(neigh_forced_gc())를 실행한다.  
+
+___neigh_create() 함수는 이 후 등록된 [constructor 함수](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L222)를 호출하여 protocol specific setup, device spepcific setup 등을 진행한다.  
+
+이웃 객체 생성 시 이웃 항목의 수가 해시 테이블 크기를 초과하면 해시 테이블을 확장해야 한다.  
+해당 작업은 neigh_hash_grow() 함수를 호출하여 수행된다.  
+
+이러한 작업의 결과들로 neighbour 객체가 이웃 해시 테이블에 추가된다.  
+
+이웃 해제에는 neigh_release() 함수가 사용된다.  
+```c
+static inline void neigh_release(struct neighbour *neigh)
+{
+	if (refcount_dec_and_test(&neigh->refcnt))
+		neigh_destroy(neigh);
+}
+```
+참조 카운트를 감소시키고, 카운트가 0이 되면 neigh_destroy 함수를 호출하여 해제한다.  
+[neigh_destroy()](https://elixir.bootlin.com/linux/latest/source/net/core/neighbour.c#L834) 함수는 neighbour 객체의 dead 플래그가 설정되어 있는 경우에만 객체를 해제한다.  
