@@ -760,3 +760,201 @@ out_of_mem:
 }
 ```
 
+우선 수신한 패킷이 로컬 장비를 목적지로 하지 않거나, 루프백 장치에 대한 것이거나 수신한 장비에 NOARP 플래그가 설정돼 있으면 패킷을 drop한다.  
+또한, ARP 헤더의 하드웨어 주소 길이가 장비의 주소 길이와 다르거나 프로토콜 사이즈가 4가 아니라면 drop한다.  
+이러한 검사가 끝나면 NF_HOOK을 호출하여 arp_process() 함수로 진입하게 된다.  
+
+arp_process() 함수에서는 ARP 요청이나 ARP 응답을 처리한다.  
+ARP 요청의 경우 ip_route_input_noref() 함수로 라우팅 서브시스템을 탐색한다.  
+ARP 패킷이 로컬 호스트에 대한 것이라면 몇 가지 조건을 검사하고 arp_send_dst() 함수를 통해 응답을 회신한다.  
+ARP 패킷이 포워딩해야 하는 것이라면 몇 가지 조건을 검사하고 pneigh_lookup() 함수를 호출해 프록시 ARP 테이블의 탐색을 수행한다.
+[arp_process()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L677) 함수의 정의는 다음과 같은데, 매우 길기 때문에 일부 내용은 생략하고 설명은 주석으로 작성한다.  
+```c
+static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct in_device *in_dev = __in_dev_get_rcu(dev);
+	struct arphdr *arp;
+	unsigned char *arp_ptr;
+	struct rtable *rt;
+	unsigned char *sha;
+	unsigned char *tha = NULL;
+	__be32 sip, tip;
+	u16 dev_type = dev->type;
+	int addr_type;
+	struct neighbour *n;
+	struct dst_entry *reply_dst = NULL;
+	bool is_garp = false;
+
+	/* ARP 헤더를 검사하여 장치가 ARP가 가능한지 확인한다.
+	 */
+
+	if (!in_dev)
+		goto out_free_skb;
+
+	/* SKB로부터 ARP 헤더를 가져온다.
+	 */
+	arp = arp_hdr(skb);
+
+	switch (dev_type) {
+	default:
+		if (arp->ar_pro != htons(ETH_P_IP) ||
+		    htons(dev_type) != arp->ar_hrd)
+			goto out_free_skb;
+		break;
+	case ARPHRD_ETHER:
+	case ARPHRD_FDDI:
+	case ARPHRD_IEEE802:
+		/*
+		 * 하드웨어 유형 검사에 대한 코드
+		 */
+	}
+
+	/* opcode가 request나 reply에 대해서만 처리한다 */
+
+	if (arp->ar_op != htons(ARPOP_REPLY) &&
+	    arp->ar_op != htons(ARPOP_REQUEST))
+		goto out_free_skb;
+
+/*
+ * 헤더의 필드 추출 코드
+ * sha : 출발지 하드웨어 주소
+ * sip : 출발지 IPv4 주소
+ * tha : 대상 하드웨어 주소
+ * tip : 대상 IPv4 주소
+ */
+	arp_ptr = (unsigned char *)(arp + 1);
+	sha	= arp_ptr;		// 출발지 하드웨어 주소 추출
+	arp_ptr += dev->addr_len;	// 오프셋 변경 (이더넷이라면 6바이트)
+	memcpy(&sip, arp_ptr, 4);	// 출발지 IPv4 주소 추출 (4바이트)
+	arp_ptr += 4;		// 오프셋 변경 (4바이트)
+	switch (dev_type) {		// 디바이스 타입에 따른 처리
+#if IS_ENABLED(CONFIG_FIREWIRE_NET)
+	case ARPHRD_IEEE1394:
+		break;
+#endif
+	default:
+		tha = arp_ptr;	// 일반적인 대상 하드웨어 주소 추출
+		arp_ptr += dev->addr_len;	// 오프셋 변경 (이더넷이라면 6바이트)
+	}
+	memcpy(&tip, arp_ptr, 4);	// 대상 IPv4 주소 추출 (4바이트)
+/*
+ *	127.x.x.x에 대한 잘못된 요청 또는 멀티캐스트 주소 요청인지 검사
+ */
+	if (ipv4_is_multicast(tip) ||
+	    (!IN_DEV_ROUTE_LOCALNET(in_dev) && ipv4_is_loopback(tip)))
+		goto out_free_skb;
+
+	...
+/*
+ *  프로세스 엔트리 (메인 루틴)
+ *  로컬 머신에 대한 request이거나, 로컬 머신이 ARP Proxy일 때
+ *  서비스 대상에 대한 request인 경우 reply를 회신한다.
+ *  해당 경우는 requester를 arp 캐시에 추가한다.
+ *  
+ *  로컬 머신에게 보내는 reply 이거나, 로컬 머신의 address에 대한
+ *  request인 경우, 처리하여 엔트리를 arp 캐시에 추가한다.
+ */
+	if (arp->ar_op == htons(ARPOP_REQUEST) && skb_metadata_dst(skb))
+		reply_dst = (struct dst_entry *)
+			    iptunnel_metadata_reply(skb_metadata_dst(skb),
+						    GFP_ATOMIC);
+	...
+	if (arp->ar_op == htons(ARPOP_REQUEST) &&		// ARP Request 패킷의 경우
+	    ip_route_input_noref(skb, tip, sip, 0, dev) == 0) {	// 라우팅 서브시스템 탐색
+
+		rt = skb_rtable(skb);
+		addr_type = rt->rt_type;
+
+		if (addr_type == RTN_LOCAL) {	// 로컬호스트에 대한 Request라면
+			int dont_send;
+			/* arp_ignore() 함수는 procfs에 있는 arp_ignore의 최대값을 확인한다.
+			 * arp_filter() 함수는 ip_route_output() 함수를 이용한 
+			 * 라우팅 테이블 탐색이 실패하거나 라우팅 항목의 송신 네트워크 장치가
+			 * ARP 요청을 수신한 네트워크 장치와 다른 경우 1을 반환하며,
+			 * 그 외의 경우 0을 반환한다.
+			 */
+			dont_send = arp_ignore(in_dev, sip, tip);	// ignore 값 확인
+			if (!dont_send && IN_DEV_ARPFILTER(in_dev))
+				dont_send = arp_filter(sip, tip, dev);	// arp filter 확인
+			if (!dont_send) {	// ARP 응답을 하는 경우
+				n = neigh_event_ns(&arp_tbl, sha, &sip, dev);	// ARP 응답 전송하기 전 이웃 테이블에 송신자를 추가하거나 업데이트 (passive learning)
+				if (n) {	// ARP Reply 회신
+					arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+						     sip, dev, tip, sha,
+						     dev->dev_addr, sha,
+						     reply_dst);
+					neigh_release(n);
+				}
+			}
+			goto out_consume_skb;
+		} else if (IN_DEV_FORWARD(in_dev)) {	// 포워딩 하는 경우
+			if (addr_type == RTN_UNICAST  &&
+			    (arp_fwd_proxy(in_dev, dev, rt) ||		// 장치가 ARP Proxy로 사용할 수 있는 경우
+			     arp_fwd_pvlan(in_dev, dev, rt, sip, tip) ||	// 장치가 ARP VLAN Proxy로 사용할 수 있는 경우
+			     (rt->dst.dev != dev &&
+			      pneigh_lookup(&arp_tbl, net, &tip, dev, 0)))) {
+				n = neigh_event_ns(&arp_tbl, sha, &sip, dev);	// 이웃 테이블에 송신자를 추가하거나 업데이트
+				if (n)
+					neigh_release(n);
+
+				if (NEIGH_CB(skb)->flags & LOCALLY_ENQUEUED ||
+				    skb->pkt_type == PACKET_HOST ||
+				    NEIGH_VAR(in_dev->arp_parms, PROXY_DELAY) == 0) {
+					arp_send_dst(ARPOP_REPLY, ETH_P_ARP,	// reply 즉시 전송
+						     sip, dev, tip, sha,
+						     dev->dev_addr, sha,
+						     reply_dst);
+				} else {	// 프록시 큐에 ARP reply의 SKB를 넣어 지연 전송
+					pneigh_enqueue(&arp_tbl,
+						       in_dev->arp_parms, skb);
+					goto out_free_dst;
+				}
+				goto out_consume_skb;
+			}
+		}
+	}
+
+	/* ARP 테이블을 업데이트한다. */
+
+	n = __neigh_lookup(&arp_tbl, &sip, dev, 0);	// 이웃 테이블 탐색 수행
+
+	...
+
+	if (n) {
+		int state = NUD_REACHABLE;
+		int override;
+
+		/* 여러 Proxy agent가 활성화되어 있을 때
+		   다수의 ARP reply가 연속되면 처음 응답만 사용한다.
+		 */
+		override = time_after(jiffies,
+				      n->updated +
+				      NEIGH_VAR(n->parms, LOCKTIME)) ||
+			   is_garp;
+
+		/* 브로드캐스트 reply와 request 패킷은
+		   이웃의 연결 가능성을 가정하지 않는다.
+		 */
+		if (arp->ar_op != htons(ARPOP_REPLY) ||
+		    skb->pkt_type != PACKET_HOST)
+			state = NUD_STALE;
+		neigh_update(n, sha, state,		// 이웃 테이블 업데이트
+			     override ? NEIGH_UPDATE_F_OVERRIDE : 0, 0);
+		neigh_release(n);
+	}
+
+out_consume_skb:
+	consume_skb(skb);
+
+out_free_dst:
+	dst_release(reply_dst);
+	return NET_RX_SUCCESS;
+
+out_free_skb:
+	kfree_skb(skb);
+	return NET_RX_DROP;
+}
+```
+
+## 예제
