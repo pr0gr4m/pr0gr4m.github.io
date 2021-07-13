@@ -371,3 +371,88 @@ static inline void neigh_release(struct neighbour *neigh)
 ```
 참조 카운트를 감소시키고, 카운트가 0이 되면 neigh_destroy 함수를 호출하여 해제한다.  
 [neigh_destroy()](https://elixir.bootlin.com/linux/latest/source/net/core/neighbour.c#L834) 함수는 neighbour 객체의 dead 플래그가 설정되어 있는 경우에만 객체를 해제한다.  
+
+### 유저 스페이스 상호작용
+
+ARP 테이블은 iproute2 패키지의 ip neigh 명령과 net-tools 패키지의 arp 명령으로 관리할 수 있다.  
+각 명령에 대한 ftrace 로그를 살펴보면 다음과 같다.  
+
+* ```ip neigh show``` : neigh_dump_info() 함수로 처리된다.
+```bash
+              ip-2041    [000] ....   112.366694: neigh_dump_info <-netlink_dump
+              ip-2041    [000] ....   112.366699: <stack trace>
+ => neigh_dump_info
+ => netlink_dump
+ => __netlink_dump_start
+ => rtnetlink_rcv_msg
+ => netlink_rcv_skb
+ => rtnetlink_rcv
+ => netlink_unicast
+ => netlink_sendmsg
+ => sock_sendmsg
+ => __sys_sendto
+ => __x64_sys_sendto
+ => do_syscall_64
+ => entry_SYSCALL_64_after_hwframe
+```
+
+* ```arp -a``` : arp_seq_show() 함수로 처리된다.
+```bash
+             arp-2042    [002] ....   114.132257: arp_seq_show <-seq_read
+             arp-2042    [002] ....   114.132261: <stack trace>
+ => arp_seq_show
+ => seq_read
+ => proc_reg_read
+ => vfs_read
+ => ksys_read
+ => __x64_sys_read
+ => do_syscall_64
+ => entry_SYSCALL_64_after_hwframe
+```
+
+## ARP Protocol 
+
+패킷 전송 시 목적지 IPv4 주소를 알고 있을 것이다. 이 때 목적지 MAC 주소를 포함한 이더넷 헤더를 만들어야 한다.  
+목적지 MAC 주소를 알지 못하는 경우, ARP 요청을 브로드캐스트로 전송한다. 이 ARP 요청에는 찾고 있는 IPv4 주소가 포함되어 있다.  
+그러한 IPv4 주소를 가진 호스트가 있으면 응답으로 유니캐스트 ARP를 보낸다.  
+ARP 헤더의 구조는 다음과 같다.  
+![arp_header](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/arp_header.png?raw=true)
+
+커널에서 구현한 ARP 헤더의 구조체는 다음과 같다.   
+```c
+struct arphdr {
+	__be16		ar_hrd;		/* format of hardware address	*/
+	__be16		ar_pro;		/* format of protocol address	*/
+	unsigned char	ar_hln;		/* length of hardware address	*/
+	unsigned char	ar_pln;		/* length of protocol address	*/
+	__be16		ar_op;		/* ARP opcode (command)		*/
+
+#if 0
+	 /*
+	  *	 Ethernet looks like this : This bit is variable sized however...
+	  */
+	unsigned char		ar_sha[ETH_ALEN];	/* sender hardware address	*/
+	unsigned char		ar_sip[4];		/* sender IP address		*/
+	unsigned char		ar_tha[ETH_ALEN];	/* target hardware address	*/
+	unsigned char		ar_tip[4];		/* target IP address		*/
+#endif
+
+};
+```
+* ar_hrd : 하드웨어 유형이며, 이더넷의 경우 0x01이다. [링크](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_arp.h#L29)에서 할당 가능한 목록들을 볼 수 있다.
+* ar_pro : 프로토콜 ID이며, IPv4의 경우 0x80이다. [링크](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_ether.h#L47)에서 할당 가능한 목록들을 볼 수 있다.
+* ar_hln : 바이트 단위의 하드웨어 주소 길이이며, 이더넷의 경우 6 바이트이다.
+* ar_pln : 바이트 단위의 프로토콜 주소 길이이며, IPv4의 경우 4 바이트이다.
+* ar_op : 동작코드(opcode)이며, ARP 요청의 경우 [ARPOP_REQUEST](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_arp.h#L106)이고, ARP 응답의 경우 [ARPOP_REPLY](https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_arp.h#L107)이다.
+
+ARP 헤더에서 opcode 이후에 송신자 하드웨어 주소, 네트워크 주소, 수신자 하드웨어 주소, 네트워크 주소가 온다.  
+이는 arphdr 구조체 내에 포함되지 않고 arp_process() 함수에서 해당하는 오프셋을 읽어 추출한다.  
+
+Neighbour Subsystem 챕터 초반에 본 바와 같이 ARP에는 [arp_generic_ops](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L130), [arp_hh_ops](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L138), [arp_direct_ops](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L146) 3개의 neigh_ops 객체가 정의돼 있다. (arp_broken_ops는 제거되었다.)  
+ARP 테이블의 neigh_ops 객체는 네트워크 장치 기능을 토대로 arp_constructor() 함수를 통해 초기화된다.  
+* net_device 객체의 header_ops가 NULL이면 neigh_ops 객체는 arp_direct_ops로 설정된다. 이 경우 패킷 전송은 neigh_direct_output() 함수에서 수행된다.
+* net_device 객체의 header_ops에 cache 콜백이 NULL이면 neigh_ops 객체는 arp_generic_ops로 설정된다.
+* net_device 객체의 header_ops에 cache 콜백이 NULL이 아니면 neigh_ops 객체는 arp_hh_ops로 설정될 것이다.
+
+### ARP 의뢰 요청 전송
+
