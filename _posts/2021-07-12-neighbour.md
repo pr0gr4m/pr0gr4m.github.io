@@ -456,3 +456,307 @@ ARP 테이블의 neigh_ops 객체는 네트워크 장치 기능을 토대로 arp
 
 ### ARP 의뢰 요청 전송
 
+ARP 의뢰 요청은 arp_solicit() 함수로 수행한다.  
+해당 함수가 어떤 상황에서 호출되는지 알아보기 위하여 dump_stack() 함수로 콜스택을 트레이싱 하면 다음과 같다.
+```bash
+[    4.803576] Call Trace:
+[    4.803582]  dump_stack+0x74/0x9a
+[    4.803585]  arp_solicit+0x47/0x22e
+[    4.803587]  ? __skb_clone+0x2e/0x120
+[    4.803588]  neigh_probe+0x52/0x70
+[    4.803589]  __neigh_event_send+0xa8/0x330
+[    4.803590]  neigh_resolve_output+0x128/0x1c0
+[    4.803592]  ip_finish_output2+0x19b/0x590
+[    4.803593]  __ip_finish_output+0xd3/0x210
+[    4.803594]  ip_finish_output+0x2d/0xb0
+[    4.803594]  ip_output+0x7a/0xf0
+[    4.803595]  ? __ip_finish_output+0x210/0x210
+[    4.803596]  ip_local_out+0x3d/0x50
+[    4.803597]  ip_send_skb+0x19/0x40
+[    4.803598]  udp_send_skb.isra.0+0x165/0x390
+[    4.803599]  udp_sendmsg+0xb0e/0xd50
+[    4.803600]  ? ip_reply_glue_bits+0x50/0x50
+[    4.803602]  ? __mod_memcg_lruvec_state+0x25/0xe0
+[    4.803604]  ? _cond_resched+0x19/0x30
+[    4.803605]  ? aa_sk_perm+0x43/0x1b0
+[    4.803606]  inet_sendmsg+0x65/0x70
+[    4.803608]  ? security_socket_sendmsg+0x35/0x50
+[    4.803609]  ? inet_sendmsg+0x65/0x70
+[    4.803610]  sock_sendmsg+0x5e/0x70
+[    4.803611]  sock_write_iter+0x93/0xf0
+[    4.803613]  new_sync_write+0x18e/0x1a0
+[    4.803614]  vfs_write+0x1a6/0x200
+[    4.803615]  ksys_write+0xb1/0xe0
+[    4.803617]  ? syscall_trace_enter.isra.0+0x8b/0x1d0
+[    4.803618]  __x64_sys_write+0x1a/0x20
+[    4.803618]  do_syscall_64+0x38/0x90
+[    4.803620]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+[   72.272896] Call Trace:
+[   72.272898]  <IRQ>
+[   72.272903]  dump_stack+0x74/0x9a
+[   72.272907]  arp_solicit+0x47/0x22e
+[   72.272909]  ? mod_timer+0x1aa/0x300
+[   72.272911]  neigh_probe+0x52/0x70
+[   72.272912]  neigh_timer_handler+0x92/0x310
+[   72.272913]  ? neigh_update+0x20/0x20
+[   72.272914]  call_timer_fn+0x32/0x130
+[   72.272915]  __run_timers.part.0+0x1e6/0x270
+[   72.272916]  ? ktime_get+0x3e/0xa0
+[   72.272918]  ? native_apic_msr_write+0x2b/0x30
+[   72.272920]  ? lapic_next_event+0x21/0x30
+[   72.272922]  ? clockevents_program_event+0x8f/0xe0
+[   72.272923]  run_timer_softirq+0x2a/0x50
+[   72.272925]  __do_softirq+0xe1/0x2da
+
+[   76.556415] Call Trace:
+[   76.556420]  dump_stack+0x74/0x9a
+[   76.556422]  arp_solicit+0x47/0x22e
+[   76.556424]  ? __skb_clone+0x2e/0x120
+[   76.556426]  neigh_probe+0x52/0x70
+[   76.556427]  __neigh_event_send+0xa8/0x330
+[   76.556427]  neigh_resolve_output+0x128/0x1c0
+[   76.556429]  ip_finish_output2+0x19b/0x590
+[   76.556430]  ? __ip_append_data.isra.0+0x91b/0xdf0
+[   76.556431]  __ip_finish_output+0xd3/0x210
+[   76.556432]  ? ping_close+0x70/0x70
+[   76.556432]  ip_finish_output+0x2d/0xb0
+[   76.556433]  ip_output+0x7a/0xf0
+[   76.556434]  ? __ip_finish_output+0x210/0x210
+[   76.556435]  ip_local_out+0x3d/0x50
+[   76.556436]  ip_send_skb+0x19/0x40
+[   76.556436]  ip_push_pending_frames+0x33/0x40
+[   76.556437]  ping_v4_sendmsg+0x431/0x750
+[   76.556440]  ? check_preempt_wakeup+0xfd/0x210
+[   76.556442]  ? _raw_spin_unlock_bh+0x1e/0x20
+[   76.556443]  inet_sendmsg+0x6c/0x70
+[   76.556443]  ? inet_sendmsg+0x6c/0x70
+[   76.556444]  sock_sendmsg+0x5e/0x70
+[   76.556445]  __sys_sendto+0x113/0x190
+[   76.556447]  ? exit_to_user_mode_prepare+0x3d/0x1b0
+[   76.556448]  ? do_user_addr_fault+0x1ef/0x3b5
+[   76.556449]  __x64_sys_sendto+0x29/0x30
+[   76.556450]  do_syscall_64+0x38/0x90
+```
+
+의뢰 요청이 발생하는 경우는 크게 타이머 만료로 인한 주기적 의뢰 요청과, tx 경로에서 ip_finish_output2() 함수에서의 의뢰 요청이 있다.  
+ip_finish_output() 함수에서는 다음과 같이 ip_neigh_for_gw() 함수를 호출하여 이웃 객체를 찾고, 해당 이웃 객체로 neigh_output() 함수를 호출하여 이웃 객체에 등록된 output() 콜백 함수를 호출한다.  
+```c
+static int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	struct dst_entry *dst = skb_dst(skb);
+	struct rtable *rt = (struct rtable *)dst;
+	struct net_device *dev = dst->dev;
+	unsigned int hh_len = LL_RESERVED_SPACE(dev);
+	struct neighbour *neigh;
+	...
+	neigh = ip_neigh_for_gw(rt, skb, &is_v6gw);
+	if (!IS_ERR(neigh)) {
+		int res;
+
+		sock_confirm_neigh(skb, neigh);
+		/* if crossing protocols, can not use the cached header */
+		res = neigh_output(neigh, skb, is_v6gw);
+		rcu_read_unlock_bh();
+		return res;
+	}
+	...
+}
+```
+ip_neigh_for_gw() 함수는 Address Family에 따라 (AF_INET/AF_INET6) ip_neigh_gw4() 함수나 ip_neigh_gw6() 함수를 호출하도록 래핑되어 있다.  
+ip_neigh_gw4() 함수의 정의는 다음과 같다.  
+```c
+static inline struct neighbour *ip_neigh_gw4(struct net_device *dev,
+					     __be32 daddr)
+{
+	struct neighbour *neigh;
+
+	neigh = __ipv4_neigh_lookup_noref(dev, daddr);
+	if (unlikely(!neigh))
+		neigh = __neigh_create(&arp_tbl, &daddr, dev, false);
+
+	return neigh;
+}
+```
+__ipv4_neigh_lookup_noref() 함수를 호출하여 ARP 테이블에서 다음 홉 IPv4 주소 탐색을 수행하고, 일치하는 이웃 항목을 찾지 못할 경우 __neigh_create() 함수를 호출해 이웃 객체를 생성한다.  
+
+ip_finish_output2() 함수에서 이웃 객체를 찾은 후 호출하는 neigh_output() 함수의 정의는 다음과 같다.  
+```c
+static inline int neigh_output(struct neighbour *n, struct sk_buff *skb,
+			       bool skip_cache)
+{
+	const struct hh_cache *hh = &n->hh;
+
+	if ((n->nud_state & NUD_CONNECTED) && hh->hh_len && !skip_cache)
+		return neigh_hh_output(hh, skb);
+	else
+		return n->output(n, skb);
+}
+```
+
+해당 함수에 처음 도달했을 경우, 이웃 객체의 nud_state는 NUD_CONNECTED가 아니며, 출력 콜백은 neigh_resolve_output() 함수가 된다.  
+[neigh_resolve_output()](https://elixir.bootlin.com/linux/latest/source/net/core/neighbour.c#L1476) 함수에서는 [neigh_event_send()](https://elixir.bootlin.com/linux/latest/source/include/net/neighbour.h#L437) 함수를 호출하는데, 해당 함수 nud_state가 NUD_CONNECTED | NUD_DELAY | NUD_PROBE 중 하나라도 세팅되어 있다면 반환하여 neigh_resolve_output() 함수에서 ```rc = dev_queue_xmit(skb);``` 라인을 수행하게 된다. 이 경우 나중에 타이머 핸들러가 호출될 때 neigh_probe() 함수가 호출되어 해당 의뢰 요청을 처리할 것이다.  
+하지만 처음 도달했을 경우, nud_state가 NUD_CONNECTED | NUD_DELAY | NUD_PROBE 가 아니므로, [__neigh_event_send()](https://elixir.bootlin.com/linux/latest/source/net/core/neighbour.c#L1111) 함수를 호출하게 되는데, 해당 함수에서 neigh_probe() 함수를 호출한다.  
+```c
+static void neigh_probe(struct neighbour *neigh)
+	__releases(neigh->lock)
+{
+	struct sk_buff *skb = skb_peek_tail(&neigh->arp_queue);
+	/* keep skb alive even if arp_queue overflows */
+	if (skb)
+		skb = skb_clone(skb, GFP_ATOMIC);
+	write_unlock(&neigh->lock);
+	if (neigh->ops->solicit)
+		neigh->ops->solicit(neigh, skb);
+	atomic_inc(&neigh->probes);
+	consume_skb(skb);
+}
+```
+neigh_probe() 함수는 위와 같이 solicit에 등록된 arp_solicit() 함수를 호출하여 ARP 의뢰 요청 패킷을 전송한다.  
+
+arp_solicit() 함수의 정의는 다음과 같다.   
+```c
+static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
+{
+	__be32 saddr = 0;
+	u8 dst_ha[MAX_ADDR_LEN], *dst_hw = NULL;
+	struct net_device *dev = neigh->dev;
+	__be32 target = *(__be32 *)neigh->primary_key;
+	int probes = atomic_read(&neigh->probes);
+	struct in_device *in_dev;
+	struct dst_entry *dst = NULL;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rcu(dev);
+	if (!in_dev) {
+		rcu_read_unlock();
+		return;
+	}
+	switch (IN_DEV_ARP_ANNOUNCE(in_dev)) {
+	default:
+	case 0:		/* By default announce any local IP */
+		if (skb && inet_addr_type_dev_table(dev_net(dev), dev,
+					  ip_hdr(skb)->saddr) == RTN_LOCAL)
+			saddr = ip_hdr(skb)->saddr;
+		break;
+	case 1:		/* Restrict announcements of saddr in same subnet */
+		if (!skb)
+			break;
+		saddr = ip_hdr(skb)->saddr;
+		if (inet_addr_type_dev_table(dev_net(dev), dev,
+					     saddr) == RTN_LOCAL) {
+			/* saddr should be known to target */
+			if (inet_addr_onlink(in_dev, target, saddr))
+				break;
+		}
+		saddr = 0;
+		break;
+	case 2:		/* Avoid secondary IPs, get a primary/preferred one */
+		break;
+	}
+	rcu_read_unlock();
+
+	if (!saddr)
+		saddr = inet_select_addr(dev, target, RT_SCOPE_LINK);
+
+	probes -= NEIGH_VAR(neigh->parms, UCAST_PROBES);
+	if (probes < 0) {
+		if (!(neigh->nud_state & NUD_VALID))
+			pr_debug("trying to ucast probe in NUD_INVALID\n");
+		neigh_ha_snapshot(dst_ha, neigh, dev);
+		dst_hw = dst_ha;
+	} else {
+		probes -= NEIGH_VAR(neigh->parms, APP_PROBES);
+		if (probes < 0) {
+			neigh_app_ns(neigh);
+			return;
+		}
+	}
+
+	if (skb && !(dev->priv_flags & IFF_XMIT_DST_RELEASE))
+		dst = skb_dst(skb);
+	arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, target, dev, saddr,
+		     dst_hw, dev->dev_addr, NULL, dst);
+}
+```
+
+IN_DEV_ARP_ANNOUNCE() 매크로는 ```/proc/sys/net/ipv4/conf/<netDevice>/arp_announce```와 ```/proc/sys/net/ipv4/conf/all/arp_announce```의 최대 값을 반환하며, 값에 따른 동작은 다음과 같다.  
+* 0 : 기본 값으로, 모든 로컬 IP에 알림
+* 1 : 같은 서브넷 상의 saddr로 알림을 제한
+* 2 : 보조 IP를 사용하지 않고 기본/선호 IP를 구함
+
+inet_select_addr() 함수에서는 지정된 범위보다 범위가 작고 대상과 서브넷이 같은 장치의 첫 번째 기본 인터페이스의 주소를 반환한다.  
+
+유저 스페이스 ARP 데몬이 동작할 경우 neigh_app_ns() 함수가 동작하고 반환한다.
+그렇지 않다면 (일반적인 경우) 최종적으로 arp_send_dst() 함수로 실제 arp 패킷 전송이 시작된다.  
+```c
+/* Create and send an arp packet. */
+static void arp_send_dst(int type, int ptype, __be32 dest_ip,
+			 struct net_device *dev, __be32 src_ip,
+			 const unsigned char *dest_hw,
+			 const unsigned char *src_hw,
+			 const unsigned char *target_hw,
+			 struct dst_entry *dst)
+{
+	struct sk_buff *skb;
+
+	/* arp on this interface. */
+	if (dev->flags & IFF_NOARP)
+		return;
+
+	skb = arp_create(type, ptype, dest_ip, dev, src_ip,
+			 dest_hw, src_hw, target_hw);
+	if (!skb)
+		return;
+
+	skb_dst_set(skb, dst_clone(dst));
+	arp_xmit(skb);
+}
+```
+
+ARP 비활성화 여부를 검사한 후, arp_create() 함수로 SKB를 생성한다.  
+이 후 skb_dst_set() 함수로 SKB의 dst를 설정하고, [arp_xmit()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/arp.c#L638) 함수를 호출하여 패킷을 전송한다.  
+
+### ARP 의뢰 요청 수신 및 응답
+
+ARP 패킷 수신 핸들러인 arp_rcv() 함수의 정의는 다음과 같다.   
+```c
+static int arp_rcv(struct sk_buff *skb, struct net_device *dev,
+		   struct packet_type *pt, struct net_device *orig_dev)
+{
+	const struct arphdr *arp;
+
+	/* do not tweak dropwatch on an ARP we will ignore */
+	if (dev->flags & IFF_NOARP ||
+	    skb->pkt_type == PACKET_OTHERHOST ||
+	    skb->pkt_type == PACKET_LOOPBACK)
+		goto consumeskb;
+
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (!skb)
+		goto out_of_mem;
+
+	/* ARP header, plus 2 device addresses, plus 2 IP addresses.  */
+	if (!pskb_may_pull(skb, arp_hdr_len(dev)))
+		goto freeskb;
+
+	arp = arp_hdr(skb);
+	if (arp->ar_hln != dev->addr_len || arp->ar_pln != 4)
+		goto freeskb;
+
+	memset(NEIGH_CB(skb), 0, sizeof(struct neighbour_cb));
+
+	return NF_HOOK(NFPROTO_ARP, NF_ARP_IN,
+		       dev_net(dev), NULL, skb, dev, NULL,
+		       arp_process);
+
+consumeskb:
+	consume_skb(skb);
+	return NET_RX_SUCCESS;
+freeskb:
+	kfree_skb(skb);
+out_of_mem:
+	return NET_RX_DROP;
+}
+```
+
