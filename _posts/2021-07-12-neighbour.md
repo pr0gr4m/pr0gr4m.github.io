@@ -958,3 +958,168 @@ out_free_skb:
 ```
 
 ## 예제
+
+neighbour 객체가 생성되는 시간(타임스탬프)를 저장해두고, procfs에 출력하는 예제이다.
+
+### include/net/neighbour.h
+
+헤더 파일을 삽입한다.
+
+```c
+#include <linux/ktime.h>
+```
+
+neighbour 구조체를 다음과 같이 수정한다.
+
+```c
+struct neighbour {
+	struct neighbour __rcu	*next;
+	struct neigh_table	*tbl;
+	struct neigh_parms	*parms;
+	unsigned long		confirmed;
+	unsigned long		updated;
+	rwlock_t		lock;
+	refcount_t		refcnt;
+	unsigned int		arp_queue_len_bytes;
+	struct sk_buff_head	arp_queue;
+	struct timer_list	timer;
+	unsigned long		used;
+	atomic_t		probes;
+	__u8			flags;
+	__u8			nud_state;
+	__u8			type;
+	__u8			dead;
+	u8			protocol;
+	seqlock_t		ha_lock;
+	unsigned char		ha[ALIGN(MAX_ADDR_LEN, sizeof(unsigned long))] __aligned(8);
+	struct hh_cache		hh;
+	int			(*output)(struct neighbour *, struct sk_buff *);
+	const struct neigh_ops	*ops;
+	struct list_head	gc_list;
+	struct rcu_head		rcu;
+	struct net_device	*dev;
+	ktime_t			tstamp;			// 추가 된 라인 (라인 162)
+	u8			primary_key[0];
+} __randomize_layout;
+```
+
+위와 같이 구조체 내에 객체가 할당된 타임스탬프를 저장할 ktime_t 필드를 추가한다.
+
+### linux/net/core/neighbour.c
+
+헤더 파일을 삽입한다.
+
+```c
+#include <linux/ktime.h>
+```
+
+neigh_alloc() 함수에 다음 라인을 추가한다.
+
+```c
+do_alloc:
+	n = kzalloc(tbl->entry_size + dev->neigh_priv_len, GFP_ATOMIC);
+	if (!n)
+		goto out_entries;
+
+	__skb_queue_head_init(&n->arp_queue);
+	rwlock_init(&n->lock);
+	seqlock_init(&n->ha_lock);
+	n->updated	  = n->used = now;
+	n->tstamp         = ktime_get_real();	// 추가 된 라인 (라인 409)
+	n->nud_state	  = NUD_NONE;
+	n->output	  = neigh_blackhole;
+	seqlock_init(&n->hh.hh_lock);
+	n->parms	  = neigh_parms_clone(&tbl->parms);
+```
+
+neighbour 객체가 생성될 때 ktime_get_real() 함수로 현재 타임스탬프를 저장하게 된다.  
+
+### linux/net/ipv4/arp.c
+
+헤더 파일을 삽입한다.
+
+```c
+#include <linux/ktime.h>
+#include <linux/time.h>
+```
+
+procfs에 정보를 쓰는 arp_seq_show() 함수 내용을 다음과 같이 수정한다.
+```c
+static int arp_seq_show(struct seq_file *seq, void *v)
+{
+	if (v == SEQ_START_TOKEN) {
+		seq_puts(seq, "IP address       HW type     Flags       "
+			      "HW address            Mask     Device      Timestamp\n");
+	} else {
+		struct neigh_seq_state *state = seq->private;
+
+		if (state->flags & NEIGH_SEQ_IS_PNEIGH)
+			arp_format_pneigh_entry(seq, v);
+		else
+			arp_format_neigh_entry(seq, v);
+	}
+
+	return 0;
+}
+```
+
+seq_puts() 함수의 내용에 Device 이 후 스페이스 6칸을 띄우고 Timestamp를 추가하였다.  
+
+이제 실제로 출력하는 arp_format_neigh_entry() 함수를 다음과 같이 수정한다.  
+```c
+static void arp_format_neigh_entry(struct seq_file *seq,
+				   struct neighbour *n)
+{
+	struct tm tm;			// tm 객체 추가
+	struct timespec64 ts;	// timespec64 객체 추가
+	char hbuffer[HBUFFERLEN];
+	int k, j;
+	char tbuf[16];
+	struct net_device *dev = n->dev;
+	int hatype = dev->type;
+
+	read_lock(&n->lock);
+	/* Convert hardware address to XX:XX:XX:XX ... form. */
+#if IS_ENABLED(CONFIG_AX25)
+	if (hatype == ARPHRD_AX25 || hatype == ARPHRD_NETROM)
+		ax2asc2((ax25_address *)n->ha, hbuffer);
+	else {
+#endif
+	for (k = 0, j = 0; k < HBUFFERLEN - 3 && j < dev->addr_len; j++) {
+		hbuffer[k++] = hex_asc_hi(n->ha[j]);
+		hbuffer[k++] = hex_asc_lo(n->ha[j]);
+		hbuffer[k++] = ':';
+	}
+	if (k != 0)
+		--k;
+	hbuffer[k] = 0;
+#if IS_ENABLED(CONFIG_AX25)
+	}
+#endif
+	sprintf(tbuf, "%pI4", n->primary_key);
+	seq_printf(seq, "%-16s 0x%-10x0x%-10x%-17s     *        %-12s",		// 포맷 변경
+		   tbuf, hatype, arp_state_to_flags(n), hbuffer, dev->name);
+	if (ktime_to_timespec64_cond(n->tstamp, &ts)) {		// 타임스탬프를 timespec64 객체로 변환
+		time64_to_tm(ts.tv_sec, 0, &tm);	// timespec64 객체를 readable하게 변환
+		seq_printf(seq, "(%ld-%d-%d %d:%d:%d)\n",	// 출력
+				tm.tm_year + 1900, tm.tm_mon + 1,
+				tm.tm_mday, tm.tm_hour + 9,
+				tm.tm_min, tm.tm_sec);
+	} else {	// 타임스탬프가 유효하지 않은 경우
+		seq_printf(seq, "(null)\n");
+	}
+	read_unlock(&n->lock);
+}
+```
+
+### 빌드 및 결과
+
+linux root 디렉토리에서 다음과 같이 빌드한다.
+
+```bash
+$ make -j8
+$ sudo make install
+```
+
+재부팅 후 ```cat /proc/net/arp``` 명령을 치면 다음과 같이 timestamp 정보가 추가된 것을 볼 수 있다.
+![arp_hol](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/arp_hol.png?raw=true)
