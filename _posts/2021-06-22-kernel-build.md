@@ -12,7 +12,7 @@ $ sudo apt update
 ```
 2. 필요 패키지 설치
 ```bash
-$ sudo apt install vim git make gcc build-essential fakeroot libncurses-dev libncurses5 libncurse5-dev bin86 libssl-dev libelf-dev xz-utils curl wget bc flex bison
+$ sudo apt install vim git make gcc build-essential fakeroot libncurses-dev libncurses5 libncurses5-dev bin86 libssl-dev libelf-dev xz-utils curl wget bc flex bison
 ```
 3. 커널 소스 코드 클론
 ```bash
