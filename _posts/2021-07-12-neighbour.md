@@ -957,7 +957,7 @@ out_free_skb:
 }
 ```
 
-## 예제
+## 예제 1
 
 neighbour 객체가 생성되는 시간(타임스탬프)를 저장해두고, procfs에 출력하는 예제이다.
 
@@ -1123,3 +1123,135 @@ $ sudo make install
 
 재부팅 후 ```cat /proc/net/arp``` 명령을 치면 다음과 같이 timestamp 정보가 추가된 것을 볼 수 있다.
 ![arp_hol](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/arp_hol.png?raw=true)
+
+## 예제 2
+
+조작된 arp reply 메시지를 보내서, 상대 arp table에 잘못된 mac address가 등록되게 하는 예제이다.
+
+### ip_km.h
+
+헤더 파일에 다음 내용을 추가한다
+
+```c
+#define KM_DEBUG_ARP_SND	19
+```
+
+### linux/net/ipv4/arp.c
+
+헤더 파일을 삽입한다.
+
+```c
+#include "ip_km.h"
+```
+
+arp_process() 함수의 내용을 다음과 같이 수정한다.
+
+```c
+	if (arp->ar_op == htons(ARPOP_REQUEST) &&
+	    ip_route_input_noref(skb, tip, sip, 0, dev) == 0) {
+
+		rt = skb_rtable(skb);
+		addr_type = rt->rt_type;
+
+		if (addr_type == RTN_LOCAL) {
+			int dont_send;
+			unsigned char a[6] = { 0, };
+
+			dont_send = arp_ignore(in_dev, sip, tip);
+			if (!dont_send && IN_DEV_ARPFILTER(in_dev))
+				dont_send = arp_filter(sip, tip, dev);
+			if (!dont_send) {
+				n = neigh_event_ns(&arp_tbl, sha, &sip, dev);
+				if (n) {	// 수정된 부분
+					a[0] = 0x12;
+					a[1] = 0x34;
+					a[2] = 0x56;
+					a[3] = 0x78;
+					a[4] = 0x90;
+					a[5] = 0xab;
+					if (km_debug_state == KM_DEBUG_ARP_SND) {
+						arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+							     sip, dev, tip, sha,
+							     a, sha,
+							     reply_dst);
+					} else {
+						arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+							     sip, dev, tip, sha,
+							     dev->dev_addr, sha,
+							     reply_dst);
+					}
+					neigh_release(n);
+				}
+			}
+			goto out_consume_skb;
+		} else if (IN_DEV_FORWARD(in_dev)) {
+			if (addr_type == RTN_UNICAST  &&
+			    (arp_fwd_proxy(in_dev, dev, rt) ||
+			     arp_fwd_pvlan(in_dev, dev, rt, sip, tip) ||
+			     (rt->dst.dev != dev &&
+			      pneigh_lookup(&arp_tbl, net, &tip, dev, 0)))) {
+				n = neigh_event_ns(&arp_tbl, sha, &sip, dev);
+				if (n)
+					neigh_release(n);
+
+				if (NEIGH_CB(skb)->flags & LOCALLY_ENQUEUED ||
+				    skb->pkt_type == PACKET_HOST ||
+				    NEIGH_VAR(in_dev->arp_parms, PROXY_DELAY) == 0) {
+					arp_send_dst(ARPOP_REPLY, ETH_P_ARP,
+						     sip, dev, tip, sha,
+						     dev->dev_addr, sha,
+						     reply_dst);
+				} else {
+					pneigh_enqueue(&arp_tbl,
+						       in_dev->arp_parms, skb);
+					goto out_free_dst;
+				}
+				goto out_consume_skb;
+			}
+		}
+	}
+```
+
+위 경우 ARP Request 메시지를 받았을 때, km_debug_state 변수값이 KM_DEBUG_ARP_SND(19) 라면 조작된 MAC 주소가 담긴 ARP Reply 메시지를 보낼 것이다.
+
+### 빌드 및 결과
+
+linux root 디렉토리에서 다음과 같이 빌드한다.
+
+```bash
+$ make -j8
+$ sudo make install
+```
+
+변조를 위해 다음과 같이 km_debug_state 값을 19로 수정한다.
+
+```bash
+# root 계정으로 작업해야 함
+$ echo 19 > /sys/kernel/debug/km_debug/val
+```
+
+VM이라면 다른 guest, 실제 머신이라면 같은 네트워크에 연결된 다른 PC에서 ping을 한 후 arp 테이블을 확인한다.
+
+```bash
+> ping 10.10.10.135 (조작된 커널이 설치된 PC의 IP 주소)
+> arp -a
+? (10.10.10.135) at 12:34:56:78:90:ab [ether] on ens33
+```
+
+정상 케이스를 보기 위해 다시 km_debug_state 값을 1000으로 수정한다.
+
+```bash
+# root 계정으로 작업해야 함
+$ echo 1000 > /sys/kernel/debug/km_debug/val
+```
+
+다른 테스트 PC에서 테이블 항목을 지운 후 다시 ping을 보내고 arp 테이블을 확인한다.
+
+```bash
+> sudo arp -d 10.10.10.135
+> ping 10.10.10.135
+> arp -a
+? (10.10.10.135) at 00:0c:29:10:1f:4a [ether] on ens33
+```
+
+![arp_hol2](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/arp_hol2.png?raw=true)
