@@ -198,7 +198,7 @@ static const struct nf_hook_ops ipv4_conntrack_ops[] = {
 };
 ```
 주요 후킹 함수는 NF_INET_PRE_ROUTING 후킹에서 처리되는 ```ipv4_conntrack_in()``` 함수와 NF_INET_LOCAL_OUT 후킹에서 처리되는 ```ipv4_conntrack_local()``` 함수이다.  
-위 두 함수의 우선순위 NF_IP_PRI_CONNTRACK(-200)는 다른 우선순위 NF_IP_PRI_CONNTRACK_HELPER(300)와 NF_IP_PRI_CONNTRACK_CONFIRM(INT_MAX)보다 높다.  
+위 두 함수의 우선순위 NF_IP_PRI_CONNTRACK(-200)는 다른 우선순위 NF_IP_PRI_CONNTRACK_CONFIRM(INT_MAX)보다 높다.  
 또한, 두 함수의 정의를 살펴보면 결국 ```nf_conntrack_in()``` 함수에 상응하는 hooknum을 전달하여 호출한다.  
 이러한 연결 추적 후킹 오퍼레이션 객체는 [nf_ct_netns_do_get()](https://elixir.bootlin.com/linux/latest/source/net/netfilter/nf_conntrack_proto.c#L466) 함수에서 등록한다.  
 다음 그림은 등록된 훅 지점에 따른 연결 추적 콜백 함수의 flow를 보여준다.  
@@ -333,8 +333,17 @@ $ iptables -A INPUT -m conntrack --ctstate RELATED -j ACCEPT
 헬퍼 객체는 ```nf_conntrack_helper_register()``` 함수와 ```nf_conntrack_helper_unregister()``` 함수로 각각 등록/해제한다.  
 헬퍼 객체 배열은 ```nf_conntrack_helpers_register()``` 함수와 ```nf_conntrack_helpers_unregister()``` 함수로 각각 등록/해제한다.  
 예를 들어, ```nf_conntrack_ftp_init()``` 함수에서 FTP 연결 추적 헬퍼를 등록하기 위하여 [nf_conntrack_helpers_register()](https://elixir.bootlin.com/linux/latest/source/net/netfilter/nf_conntrack_ftp.c#L603) 함수를 호출한다.  
+연결 추적 헬퍼는 [해시 테이블](https://elixir.bootlin.com/linux/latest/source/include/net/netfilter/nf_conntrack_helper.h#L160)에 유지된다.  
+```nf_conntrack_helper``` 객체는 ```nf_ct_helper_init()``` 함수로 초기화되는데, 해당 과정에서 객체 멤버 help 함수 포인터에 헬퍼 함수를 등록한다.  
+FTP에 등록되는 help 함수는 [링크](https://elixir.bootlin.com/linux/latest/source/net/netfilter/nf_conntrack_ftp.c#L373)와 같다.  
+해당 함수에서 ```exp = nf_ct_expect_alloc(ct);``` 함수와 ```nf_ct_expect_init()``` 함수를 호출하여 expectation 객체를 할당/초기화 한다.  
+나중에 ```nf_conntrack_in()``` 함수에서 ```resolve_normal_ct()``` -> ```init_conntrack()``` 함수를 호출하여 새로운 연결이 생성되면 이 연결에 예상 객체가 포함되어있는지 검사하고, 포함되어 있다면 IPS_EXPECTED_BIT 플래그를 설정하고 ```ct->master = exp->master;``` 라인으로 마스터 연결을 설정한다.  
 
-
+헬퍼는 사전에 정의된 포트를 리스닝한다. 예를 들어, FTP 헬퍼는 기본적으로 21번 포트를 리스닝하고, 다음 두 가지 방법으로 리스닝할 포트를 추가할 수 있다.  
+* modprobe 파라미터
+    * ```modprobe nf_conntrack_ftp ports=2022,2023,2024```
+* iptables CT
+    * ```iptables -A PREROUTING -t raw -p tcp --dport 8888 -j CT --helper ftp```
 
 ## IPTables
 
