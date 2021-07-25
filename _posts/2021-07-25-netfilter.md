@@ -331,7 +331,8 @@ $ iptables -A INPUT -m conntrack --ctstate RELATED -j ACCEPT
 
 연결 추적 헬퍼는 [nf_conntrack_helper](https://elixir.bootlin.com/linux/latest/source/include/net/netfilter/nf_conntrack_helper.h#L32) 구조체로 표현한다.  
 헬퍼 객체는 ```nf_conntrack_helper_register()``` 함수와 ```nf_conntrack_helper_unregister()``` 함수로 각각 등록/해제한다.  
-예를 들어, ```nf_conntrack_ftp_init()``` 함수에서 FTP 연결 추적 헬퍼를 등록하기 위하여 [nf_conntrack_helper_register()](https://elixir.bootlin.com/linux/latest/source/net/netfilter/nf_conntrack_ftp.c#L631) 함수를 호출한다.  
+헬퍼 객체 배열은 ```nf_conntrack_helpers_register()``` 함수와 ```nf_conntrack_helpers_unregister()``` 함수로 각각 등록/해제한다.  
+예를 들어, ```nf_conntrack_ftp_init()``` 함수에서 FTP 연결 추적 헬퍼를 등록하기 위하여 [nf_conntrack_helpers_register()](https://elixir.bootlin.com/linux/latest/source/net/netfilter/nf_conntrack_ftp.c#L603) 함수를 호출한다.  
 
 
 
