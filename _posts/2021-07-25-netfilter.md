@@ -3,7 +3,7 @@ title: "Linux Kernel Netfilter"
 categories: linux kernel
 ---
 
-해당 포스트에서는 리눅스 커널의 넷필터에 대해 설명합니다.
+해당 포스트에서는 리눅스 커널의 넷필터에 대해 설명합니다.  
 넷필터 서브시스템은 네트워크 스택 내에서 패킷이 이동하는 여러 지점에 콜백을 등록하는 것을 비롯해 주소나 포트 변경, 패킷 drop, 로깅 등과 같이 패킷 상의 다양한 동작을 수행할 수 있는 프레임워크를 제공합니다.  
 
 ## 넷필터 프레임워크
@@ -158,3 +158,73 @@ struct nf_hook_ops {
 * ```int nf_register_hooks(struct nf_hook_ops *reg, unsigned int n);``` : 여러 개의 넷필터 훅을 ops 객체 배열로 등록한다. 두 번째 매개변수는 배열의 요소 개수이다.
 * ```void nf_unregister_hooks(struct nf_hook_ops *reg, unsigned int n);``` : 여러 개의 등록된 넷필터 훅을 해제한다. 두 번째 매개변수는 배열의 요소 개수이다.
 
+## Connection Tracking
+
+FTP 또는 SIP와 같은 세션 기반 트래픽을 고려하여 커널은 연결 추적 기능을 제공한다.  
+연결 추적 계층의 주요 목적은 NAT의 기반 역할을 하는 것이다.  
+
+### Connection Tracking 초기화
+
+IPv4의 연결 추적 초기화를 위한 ```nf_hook_ops``` 객체의 배열은 다음과 같이 정의되어 있다.  
+```c
+/* Connection tracking may drop packets, but never alters them, so
+   make it the first hook. */
+static struct nf_hook_ops ipv4_conntrack_ops[] __read_mostly = {
+	{
+		.hook		= ipv4_conntrack_in,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_PRE_ROUTING,
+		.priority	= NF_IP_PRI_CONNTRACK,
+	},
+	{
+		.hook		= ipv4_conntrack_local,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_OUT,
+		.priority	= NF_IP_PRI_CONNTRACK,
+	},
+	{
+		.hook		= ipv4_helper,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_POST_ROUTING,
+		.priority	= NF_IP_PRI_CONNTRACK_HELPER,
+	},
+	{
+		.hook		= ipv4_confirm,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_POST_ROUTING,
+		.priority	= NF_IP_PRI_CONNTRACK_CONFIRM,
+	},
+	{
+		.hook		= ipv4_helper,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_IN,
+		.priority	= NF_IP_PRI_CONNTRACK_HELPER,
+	},
+	{
+		.hook		= ipv4_confirm,
+		.owner		= THIS_MODULE,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_IN,
+		.priority	= NF_IP_PRI_CONNTRACK_CONFIRM,
+	},
+};
+```
+주요 후킹 함수는 NF_INET_PRE_ROUTING 후킹에서 처리되는 ```ipv4_conntrack_in()``` 함수와 NF_INET_LOCAL_OUT 후킹에서 처리되는 ```ipv4_conntrack_local()``` 함수이다.  
+위 두 함수의 우선순위 NF_IP_PRI_CONNTRACK(-200)는 다른 우선순위 NF_IP_PRI_CONNTRACK_HELPER(300)와 NF_IP_PRI_CONNTRACK_CONFIRM(INT_MAX)보다 높다.  
+또한, 두 함수의 정의를 살펴보면 결국 ```nf_conntrack_in()``` 함수에 상응하는 hooknum을 전달하여 호출한다.  
+이러한 연결 추적 후킹 오퍼레이션 객체는 [nf_conntrack_l3proto_ipv4_init()](https://elixir.bootlin.com/linux/v4.3/source/net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c#L451) 함수에서 등록한다.  
+다음 그림은 등록된 훅 지점에 따른 연결 추적 콜백 함수의 flow를 보여준다.  
+![conn_track](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/conn_track.png?raw=true)
+
+### 연결 추적 항목
+
+
+
+## IPTables
+
+## NAT
