@@ -744,3 +744,39 @@ AMD 서버에서는 DNAT 규칙에 따라 목적지 주소를 192.168.1.8로 변
 다음 그림은 해당 상황에서의 UDP 패킷의 flow이다.  
 ![nat_hook](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/nat_hook.png?raw=true)
 
+패킷 헤더를 변경하는 동작은 다음 [nf_nat_hook](https://elixir.bootlin.com/linux/latest/source/include/linux/netfilter.h#L369) 객체의 ```manip_pkt``` 멤버에 등록한 ```nf_nat_manip_pkt()``` 함수로 수행한다.  
+```c
+static struct nf_nat_hook nat_hook = {
+	.parse_nat_setup	= nfnetlink_parse_nat_setup,
+#ifdef CONFIG_XFRM
+	.decode_session		= __nf_nat_decode_session,
+#endif
+	.manip_pkt		= nf_nat_manip_pkt,
+};
+
+unsigned int nf_nat_manip_pkt(struct sk_buff *skb, struct nf_conn *ct,
+			      enum nf_nat_manip_type mtype,
+			      enum ip_conntrack_dir dir)
+{
+	struct nf_conntrack_tuple target;
+
+	/* We are aiming to look like inverse of other direction. */
+	nf_ct_invert_tuple(&target, &ct->tuplehash[!dir].tuple);
+
+	switch (target.src.l3num) {
+	case NFPROTO_IPV6:
+		if (nf_nat_ipv6_manip_pkt(skb, 0, &target, mtype))
+			return NF_ACCEPT;
+		break;
+	case NFPROTO_IPV4:
+		if (nf_nat_ipv4_manip_pkt(skb, 0, &target, mtype))
+			return NF_ACCEPT;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		break;
+	}
+
+	return NF_DROP;
+}
+```
