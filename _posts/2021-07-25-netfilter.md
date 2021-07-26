@@ -488,3 +488,239 @@ drop:
 
 ## NAT
 
+NAT는 주로 IP 주소 변환이나 포트 조작을 다룬다.  
+넷필터 서브시스템 NAT 구현체에서는 -j 플래그를 사용하여 SNAT 또는 DNAT를 선택할 수 있다.  
+
+### NAT 초기화
+
+NAT 테이블은 필터 테이블과 마찬가지로 ```xt_table``` 구조체로 표현한다.  
+NAT 훅은 NF_INET_FORWARD 훅 지점을 제외한 모든 훅 지점에 등록된다.  
+```c
+static const struct xt_table nf_nat_ipv4_table = {
+	.name		= "nat",
+	.valid_hooks	= (1 << NF_INET_PRE_ROUTING) |
+			  (1 << NF_INET_POST_ROUTING) |
+			  (1 << NF_INET_LOCAL_OUT) |
+			  (1 << NF_INET_LOCAL_IN),
+	.me		= THIS_MODULE,
+	.af		= NFPROTO_IPV4,
+	.table_init	= iptable_nat_table_init,
+};
+```
+
+각 훅 지점에 등록할 NAT 오퍼레이션 객체는 다음과 같다.  
+```c
+static const struct nf_hook_ops nf_nat_ipv4_ops[] = {
+	{
+		.hook		= iptable_nat_do_chain,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_PRE_ROUTING,
+		.priority	= NF_IP_PRI_NAT_DST,
+	},
+	{
+		.hook		= iptable_nat_do_chain,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_POST_ROUTING,
+		.priority	= NF_IP_PRI_NAT_SRC,
+	},
+	{
+		.hook		= iptable_nat_do_chain,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_OUT,
+		.priority	= NF_IP_PRI_NAT_DST,
+	},
+	{
+		.hook		= iptable_nat_do_chain,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_IN,
+		.priority	= NF_IP_PRI_NAT_SRC,
+	},
+};
+```
+
+NAT 테이블 초기화는 [iptable_nat_init()](https://elixir.bootlin.com/linux/latest/source/net/ipv4/netfilter/iptable_nat.c#L156) 함수에서 수행한다.  
+초기화 과정에서 호출하는 ```ipt_nat_register_lookups()``` 함수의 정의는 다음과 같다.  
+```c
+static int ipt_nat_register_lookups(struct net *net)
+{
+	struct iptable_nat_pernet *xt_nat_net;
+	struct nf_hook_ops *ops;
+	struct xt_table *table;
+	int i, ret;
+
+	xt_nat_net = net_generic(net, iptable_nat_net_id);
+	table = xt_find_table(net, NFPROTO_IPV4, "nat");
+	if (WARN_ON_ONCE(!table))
+		return -ENOENT;
+
+	ops = kmemdup(nf_nat_ipv4_ops, sizeof(nf_nat_ipv4_ops), GFP_KERNEL);
+	if (!ops)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(nf_nat_ipv4_ops); i++) {
+		ops[i].priv = table;
+		ret = nf_nat_ipv4_register_fn(net, &ops[i]);
+		if (ret) {
+			while (i)
+				nf_nat_ipv4_unregister_fn(net, &ops[--i]);
+
+			kfree(ops);
+			return ret;
+		}
+	}
+
+	xt_nat_net->nf_nat_ops = ops;
+	return 0;
+}
+
+int nf_nat_ipv4_register_fn(struct net *net, const struct nf_hook_ops *ops)
+{
+	return nf_nat_register_fn(net, ops->pf, ops, nf_nat_ipv4_ops,
+				  ARRAY_SIZE(nf_nat_ipv4_ops));
+}
+```
+
+보이는 것과 같이 ```nf_nat_ipv4_register_fn()``` 함수가 호출되는데, 해당 함수에서 다음과 같이 NAT 오퍼레이션 객체를 등록한다.  
+```c
+static const struct nf_hook_ops nf_nat_ipv4_ops[] = {
+	/* Before packet filtering, change destination */
+	{
+		.hook		= nf_nat_ipv4_pre_routing,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_PRE_ROUTING,
+		.priority	= NF_IP_PRI_NAT_DST,
+	},
+	/* After packet filtering, change source */
+	{
+		.hook		= nf_nat_ipv4_out,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_POST_ROUTING,
+		.priority	= NF_IP_PRI_NAT_SRC,
+	},
+	/* Before packet filtering, change destination */
+	{
+		.hook		= nf_nat_ipv4_local_fn,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_OUT,
+		.priority	= NF_IP_PRI_NAT_DST,
+	},
+	/* After packet filtering, change source */
+	{
+		.hook		= nf_nat_ipv4_local_in,
+		.pf		= NFPROTO_IPV4,
+		.hooknum	= NF_INET_LOCAL_IN,
+		.priority	= NF_IP_PRI_NAT_SRC,
+	},
+};
+```
+
+### NAT 훅 콜백
+
+오퍼레이션 객체에서 등록된 함수들(```nf_nat_ipv4_local_fn()```, ```nf_nat_ipv4_local_in()``` 등)의 정의를 보면 결국 ```nf_nat_ipv4_fn()``` 함수를 호출한다.  
+해당 함수의 정의는 다음과 같다.  
+```c
+static unsigned int
+nf_nat_ipv4_fn(void *priv, struct sk_buff *skb,
+	       const struct nf_hook_state *state)
+{
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct)
+		return NF_ACCEPT;
+
+	if (ctinfo == IP_CT_RELATED || ctinfo == IP_CT_RELATED_REPLY) {
+		if (ip_hdr(skb)->protocol == IPPROTO_ICMP) {
+			if (!nf_nat_icmp_reply_translation(skb, ct, ctinfo,
+							   state->hook))
+				return NF_DROP;
+			else
+				return NF_ACCEPT;
+		}
+	}
+
+	return nf_nat_inet_fn(priv, skb, state);
+}
+```
+
+연결 추적 정보를 구한 후, ```nf_nat_inet_fn()``` 함수를 호출한다.  
+해당 함수의 정의는 다음과 같다.  
+```c
+unsigned int
+nf_nat_inet_fn(void *priv, struct sk_buff *skb,
+	       const struct nf_hook_state *state)
+{
+	struct nf_conn *ct;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn_nat *nat;
+	/* maniptype == SRC for postrouting. */
+	enum nf_nat_manip_type maniptype = HOOK2MANIP(state->hook);
+
+	ct = nf_ct_get(skb, &ctinfo);
+	/* Can't track?  It's not due to stress, or conntrack would
+	 * have dropped it.  Hence it's the user's responsibilty to
+	 * packet filter it out, or implement conntrack/NAT for that
+	 * protocol. 8) --RR
+	 */
+	if (!ct)
+		return NF_ACCEPT;
+
+	nat = nfct_nat(ct);
+
+	switch (ctinfo) {
+	case IP_CT_RELATED:
+	case IP_CT_RELATED_REPLY:
+		/* Only ICMPs can be IP_CT_IS_REPLY.  Fallthrough */
+	case IP_CT_NEW:
+		/* Seen it before?  This can happen for loopback, retrans,
+		 * or local packets.
+		 */
+		if (!nf_nat_initialized(ct, maniptype)) {
+			struct nf_nat_lookup_hook_priv *lpriv = priv;
+			struct nf_hook_entries *e = rcu_dereference(lpriv->entries);
+			unsigned int ret;
+			int i;
+
+			if (!e)
+				goto null_bind;
+
+			for (i = 0; i < e->num_hook_entries; i++) {
+				ret = e->hooks[i].hook(e->hooks[i].priv, skb,
+						       state);
+				if (ret != NF_ACCEPT)
+					return ret;
+				if (nf_nat_initialized(ct, maniptype))
+					goto do_nat;
+			}
+null_bind:
+			ret = nf_nat_alloc_null_binding(ct, state->hook);
+			if (ret != NF_ACCEPT)
+				return ret;
+		} else {
+			pr_debug("Already setup manip %s for ct %p (status bits 0x%lx)\n",
+				 maniptype == NF_NAT_MANIP_SRC ? "SRC" : "DST",
+				 ct, ct->status);
+			if (nf_nat_oif_changed(state->hook, ctinfo, nat,
+					       state->out))
+				goto oif_changed;
+		}
+		break;
+	default:
+		/* ESTABLISHED */
+		WARN_ON(ctinfo != IP_CT_ESTABLISHED &&
+			ctinfo != IP_CT_ESTABLISHED_REPLY);
+		if (nf_nat_oif_changed(state->hook, ctinfo, nat, state->out))
+			goto oif_changed;
+	}
+do_nat:
+	return nf_nat_packet(ct, ctinfo, state->hook, skb);
+
+oif_changed:
+	nf_ct_kill_acct(ct, ctinfo, skb);
+	return NF_DROP;
+}
+```
+
+### 중복 훅 콜백
+
