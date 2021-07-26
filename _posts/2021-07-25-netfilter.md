@@ -347,4 +347,144 @@ FTP에 등록되는 help 함수는 [링크](https://elixir.bootlin.com/linux/lat
 
 ## IPTables
 
+iptables는 ```/net/ipv[4,6]/netfilter``` 아래에 존재하는 핵심 커널 코드와, iptables 계층에 접근하기 위한 유저 스페이스 프론트엔드 부분으로 나눠진다.  
+각 테이블은 [xt_table](https://elixir.bootlin.com/linux/latest/source/include/linux/netfilter/x_tables.h#L223) 구조체로 표현하며, ```ipt_register_table()``` 함수와 ```ipt_unregister_table_exit()``` 함수로 등록 및 해제한다.  
+
+실제 테이블 예시는 다음과 같다.  
+```c
+#define FILTER_VALID_HOOKS ((1 << NF_INET_LOCAL_IN) | \
+			    (1 << NF_INET_FORWARD) | \
+			    (1 << NF_INET_LOCAL_OUT))
+static int __net_init iptable_filter_table_init(struct net *net);
+
+static const struct xt_table packet_filter = {
+	.name		= "filter",
+	.valid_hooks	= FILTER_VALID_HOOKS,
+	.me		= THIS_MODULE,
+	.af		= NFPROTO_IPV4,
+	.priority	= NF_IP_PRI_FILTER,
+	.table_init	= iptable_filter_table_init,
+};
+
+static unsigned int
+iptable_filter_hook(void *priv, struct sk_buff *skb,
+		    const struct nf_hook_state *state)
+{
+	return ipt_do_table(skb, state, priv);
+}
+
+static struct nf_hook_ops *filter_ops __read_mostly;
+
+static int __net_init iptable_filter_table_init(struct net *net)
+{
+	struct ipt_replace *repl;
+	int err;
+
+	repl = ipt_alloc_initial_table(&packet_filter);
+	if (repl == NULL)
+		return -ENOMEM;
+	/* Entry 1 is the FORWARD hook */
+	((struct ipt_standard *)repl->entries)[1].target.verdict =
+		forward ? -NF_ACCEPT - 1 : -NF_DROP - 1;
+
+	err = ipt_register_table(net, &packet_filter, repl, filter_ops);
+	kfree(repl);
+	return err;
+}
+
+static int __init iptable_filter_init(void)
+{
+	int ret;
+
+	filter_ops = xt_hook_ops_alloc(&packet_filter, iptable_filter_hook);
+	if (IS_ERR(filter_ops))
+		return PTR_ERR(filter_ops);
+
+	ret = register_pernet_subsys(&iptable_filter_net_ops);
+	if (ret < 0)
+		kfree(filter_ops);
+
+	return ret;
+}
+```
+
+모듈 초기화 함수인 ```iptable_filter_init()``` 함수에서 테이블 및 오퍼레이션 등록 등의 초기화를 수행한다.  
+테이블 객체 packet_filter에서는 테이블 초기화 함수를 ```iptable_filter_table_init()``` 함수로 등록한다.  
+해당 초기화 함수에서 ```err = ipt_register_table(net, &packet_filter, repl, filter_ops);``` 라인으로 테이블을 등록한다.  
+
+필터 테이블에는 세 가지 훅이 있다.
+* NF_INET_LOCAL_IN
+* NF_INET_FORWARD
+* NF_INET_LOCAL_OUT
+
+필터 테이블 규칙을 통해 포워딩되는 트래픽의 flow는 다음과 같다.  
+![iptables](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/iptables.png?raw=true)
+
+예를 들어 다음과 같은 명령으로 규칙을 설정할 수 있다.  
+```bash
+$ iptables -A INPUT -p udp --dport=5001 -j LOG --log-level 1
+```
+
+해당 규칙에 의해 5001 포트를 목적지로 하는 수신 UDP 패킷을 syslog에 덤프할 것이다.  
+5001 포트를 목적지로 하는 UDP 패킷은 네트워크 드라이버에 도착하여 L3 계층으로 올라갈 때 NF_INET_PRE_ROUTING 훅을 만날 것이다.  
+하지만 필터 테이블 콜백은 해당 지점에 훅을 등록하지 않는다.  
+따라서, 그대로 ```ip_rcv_finish()``` 함수로 진행하여 라우팅 서브시스템 탐색을 수행한다.  
+이 후 로컬에 전달되거나 포워딩되는데, NF_INET_LOCAL_IN 훅이나 NF_INET_FORWARD 훅에서 등록된 ```iptable_filter_hook()``` 함수가 실행될 것이다.  
+```iptable_filter_hook()``` 함수에서 ```ipt_do_table()``` 함수를 호출하여 등록된 규칙에 맞는 처리를 수행할 것이다.  
+
+### 로컬 호스트 전달
+
+패킷이 로컬 호스트에 전달되는 경우 ```ip_local_deliver()``` 함수가 실행될 것이다.  
+```c
+int ip_local_deliver(struct sk_buff *skb)
+{
+	/*
+	 *	Reassemble IP fragments.
+	 */
+	struct net *net = dev_net(skb->dev);
+
+	if (ip_is_fragment(ip_hdr(skb))) {
+		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER))
+			return 0;
+	}
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_IN,
+		       net, NULL, skb, skb->dev, NULL,
+		       ip_local_deliver_finish);
+}
+```
+
+위 정의처럼 NF_INET_LOCAL_IN 필터 테이블 훅이 있으므로, ```iptable_filter_hook()``` 함수를 호출할 것이다.  
+
+### 포워딩
+
+패킷이 포워딩 되는 경우 ```ip_forward()``` 함수가 실행될 것이다.
+```c
+int ip_forward(struct sk_buff *skb)
+{
+	...
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD,
+		       net, NULL, skb, skb->dev, rt->dst.dev,
+		       ip_forward_finish);
+
+sr_failed:
+	/*
+	 *	Strict routing permits no gatewaying
+	 */
+	 icmp_send(skb, ICMP_DEST_UNREACH, ICMP_SR_FAILED, 0);
+	 goto drop;
+
+too_many_hops:
+	/* Tell the sender its packet died... */
+	__IP_INC_STATS(net, IPSTATS_MIB_INHDRERRORS);
+	icmp_send(skb, ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, 0);
+drop:
+	kfree_skb(skb);
+	return NET_RX_DROP;
+}
+```
+
+마찬가지로 NF_INET_FORWARD 필터 테이블 훅이 있으므로, ```iptable_filter_hook()``` 함수를 호출할 것이다.
+
 ## NAT
+
