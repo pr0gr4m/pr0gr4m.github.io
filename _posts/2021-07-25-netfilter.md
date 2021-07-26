@@ -724,3 +724,23 @@ oif_changed:
 
 ### 중복 훅 콜백
 
+하나의 훅 지점에 여러 콜백이 등록될 수 있다.  
+NAT 콜백과 연결 추적 콜백이 모두 등록되는 훅 지점이 있다.  
+예를 들어 NF_INET_PRE_ROUTING 훅에 ```ipv4_conntrack_in()```와 ```nf_nat_ipv4_pre_routing()``` 함수가 등록된다.  
+두 함수 각각 우선순위가 NF_IP_PRI_CONNTRACK(-200)와 NF_IP_PRI_NAT_DST(-100)이다.  
+우선순위가 낮은 ```ipv4_conntrack_in()``` 콜백이 먼저 호출되어, 연결 추적 계층에서 탐색을 먼저 수행한다.  
+해당 함수에서 연결 추적 항목을 찾지 못하면 ```nf_nat_ipv4_pre_routing()``` 함수에서 NAT 작업을 정상적으로 수행할 수 없게 된다.  
+
+예시로, 다음과 같은 DNAT 규칙을 만들 수 있다.  
+```bash
+$ iptables -t nat -A PREROUTING -j DNAT -p udp --dport 9999 --to-destination 192.168.1.8
+```
+
+해당 규칙의 의미는 9999번 UDP 목적지 포트로 송신하는 UDP 패킷이 수신되면, 패킷의 목적지 IP 주소를 192.168.1.8로 변경하는 것이다.  
+이를 그림으로 나타내면 다음과 같다.  
+![dnat_rule](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/dnat_rule.png?raw=true)
+리눅스 데스크톱에서는 UDP 목적지 포트를 9999로 설정하여 192.168.1.9 주소로 UDP 패킷을 송신한다.  
+AMD 서버에서는 DNAT 규칙에 따라 목적지 주소를 192.168.1.8로 변경하여 패킷을 노트북에 송신한다.  
+다음 그림은 해당 상황에서의 UDP 패킷의 flow이다.  
+![nat_hook](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/nat_hook.png?raw=true)
+
