@@ -879,3 +879,15 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f ${TARGETS}
 ```
+
+### 빌드 및 결과
+
+위의 소스 코드들은 커널 디렉토리가 아닌 일반 디렉토리에서 작성하여 다음과 같이 빌드 및 실행한다.
+```bash
+$ make
+$ sudo insmod http_netfilter.ko
+```
+
+이 후 웹 브라우저로 웹 서핑 시 패킷 중 HTTP 라는 문자열이 포함 된 패킷은 drop 되어 브라우징이 되지 않을 것이다.  
+dmesg로 커널 메시지를 확인하면 다음과 같다.  
+![netfilter_hol](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/netfilter_hol.png?raw=true)
