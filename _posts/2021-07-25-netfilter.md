@@ -742,6 +742,7 @@ $ iptables -t nat -A PREROUTING -j DNAT -p udp --dport 9999 --to-destination 192
 리눅스 데스크톱에서는 UDP 목적지 포트를 9999로 설정하여 192.168.1.9 주소로 UDP 패킷을 송신한다.  
 AMD 서버에서는 DNAT 규칙에 따라 목적지 주소를 192.168.1.8로 변경하여 패킷을 노트북에 송신한다.  
 다음 그림은 해당 상황에서의 UDP 패킷의 flow이다.  
+
 ![nat_hook](https://github.com/pr0gr4m/pr0gr4m.github.io/blob/master/img/nat_hook.png?raw=true)
 
 패킷 헤더를 변경하는 동작은 다음 [nf_nat_hook](https://elixir.bootlin.com/linux/latest/source/include/linux/netfilter.h#L369) 객체의 ```manip_pkt``` 멤버에 등록한 ```nf_nat_manip_pkt()``` 함수로 수행한다.  
@@ -779,4 +780,102 @@ unsigned int nf_nat_manip_pkt(struct sk_buff *skb, struct nf_conn *ct,
 
 	return NF_DROP;
 }
+```
+
+## 예제
+
+http 메시지를 필터링하는 넷필터 모듈을 작성한다.
+
+### http_netfilter.c
+
+```c
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/netdevice.h>
+
+static unsigned int hook_http(void *priv,
+		struct sk_buff *skb, const struct nf_hook_state *state)
+{
+	struct iphdr *iph;
+	struct tcphdr *th;
+	char *data = NULL;
+	int length = 0;
+	
+	if (!skb)
+		return NF_ACCEPT;
+
+	iph = ip_hdr(skb);
+
+	if (iph->protocol == IPPROTO_TCP) {
+		th = tcp_hdr(skb);
+
+		length = skb->len - iph->ihl * 4 - th->doff * 4;
+		if (length <= 4)
+			return NF_ACCEPT;
+
+		data = kzalloc(length, GFP_KERNEL);
+		memcpy(data, (unsigned char *)th + th->doff * 4, length);
+
+		if (strstr(data, "HTTP") != NULL) {
+			printk("[Kernel:%s] HTTP Detected\n", __func__);
+			kfree(data);
+			return NF_DROP;
+		}
+
+		kfree(data);
+	}
+
+	return NF_ACCEPT;
+}
+
+static struct nf_hook_ops *nf_ops = NULL;
+
+static int __init nfilter_init(void)
+{
+	nf_ops = (struct nf_hook_ops *)kzalloc(sizeof(struct nf_hook_ops), GFP_KERNEL);
+	nf_ops->hook = (nf_hookfn *)hook_http;
+	nf_ops->pf = PF_INET;
+	nf_ops->hooknum = NF_INET_LOCAL_IN;
+	nf_ops->priority = NF_IP_PRI_FIRST;
+
+	nf_register_net_hook(&init_net, nf_ops);
+	printk("[Kernel:%s] NFilter Init\n", __func__);
+	return 0;
+}
+
+static void __exit nfilter_exit(void)
+{
+	nf_unregister_net_hook(&init_net, nf_ops);
+	kfree(nf_ops);
+	printk("[Kernel:%s] NFilter Exit\n", __func__);
+}
+
+module_init(nfilter_init);
+module_exit(nfilter_exit);
+MODULE_LICENSE("GPL");
+```
+
+### Makefile
+
+```makefile
+obj-m += http_netfilter.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+
+default:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+CC := gcc
+
+%.c%:
+	${CC} -o $@ $^
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f ${TARGETS}
 ```
